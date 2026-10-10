@@ -97,12 +97,12 @@ export function normalizeDecisionSettings(raw: Record<string, unknown>): Decisio
   const verbose = booleanSetting(raw, "verbose", false);
   const endpointValue = stringSetting(raw, "endpoint", "");
   const deployment = stringSetting(raw, "deployment", "");
-  const reviewModel = stringSetting(raw, "reviewModel", "@advisor");
+  const reviewModel = stringSetting(raw, "reviewModel", "");
   const credentialMode = raw.credentialMode === undefined ? "azure-cli" : raw.credentialMode;
   const passThreshold = numberSetting(raw, "passThreshold", 0.8);
   const timeoutMs = numberSetting(raw, "timeoutMs", 10_000);
   const advisorTimeoutMs = numberSetting(raw, "advisorTimeoutMs", 20_000);
-  const reviewTools = parseReviewTools(stringSetting(raw, "reviewTools", "read,grep,glob")).join(",");
+  const reviewTools = parseReviewTools(stringSetting(raw, "reviewTools", "read,grep,find")).join(",");
   const reviewInstructions = raw.reviewInstructions === undefined ? "" : raw.reviewInstructions;
   if (typeof reviewInstructions !== "string") throw new Error("reviewInstructions must be a string.");
   if (/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/.test(reviewInstructions)) {
@@ -117,8 +117,8 @@ export function normalizeDecisionSettings(raw: Record<string, unknown>): Decisio
   }
   const endpoint = endpointValue ? validateEndpoint(endpointValue) : "";
   if (deployment) validateDeployment(deployment);
-  if (!reviewModel || /[\u0000-\u001f\u007f]/.test(reviewModel)) {
-    throw new Error("Reviewer model must be a nonblank OMP model selector or role, without control characters.");
+  if (reviewModel && (!/^[^\s/@]+\/[^\s@]+$/.test(reviewModel) || /[\u0000-\u001f\u007f-\u009f]/.test(reviewModel))) {
+    throw new Error("Reviewer model must be an explicit provider/model ID, or blank when unconfigured.");
   }
   validateCredentialMode(credentialMode);
   validateThreshold(passThreshold);

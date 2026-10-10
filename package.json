@@ -1,55 +1,33 @@
 {
-  "name": "omp-decision-advisor",
-  "version": "0.5.0",
+  "name": "pi-decision-advisor",
+  "version": "0.7.0",
   "private": true,
   "type": "module",
-  "description": "Silent Azure Decision-1 triage with a configurable escalation reviewer and native OMP settings",
+  "description": "Azure Decision-1 turn triage with an isolated configurable Pi escalation reviewer",
   "license": "UNLICENSED",
-  "keywords": ["omp", "omp-extension", "azure", "advisor"],
+  "keywords": ["pi-package", "azure", "advisor"],
   "files": ["src/"],
-  "engines": { "node": ">=22" },
-  "omp": {
-    "extensions": ["src/index.ts"],
-    "settings": {
-      "enabled": { "type": "boolean", "default": true, "description": "Enable automatic decision scoring and extension escalation reviews; explicit status smoke tests remain available when off." },
-      "verbose": { "type": "boolean", "default": false, "description": "Show all scoring results, full review JSON and reviewer-request progress; off uses concise advisor-style output." },
-      "endpoint": { "type": "string", "default": "", "description": "Existing Azure AIServices account HTTPS origin; no credentials, paths, query or fragment." },
-      "deployment": { "type": "string", "default": "", "description": "Existing healthy Microsoft-Decision-1 deployment name." },
-      "reviewModel": { "type": "string", "default": "@advisor", "description": "Extension reviewer model: OMP advisor role or explicit provider/model selector; not native advisor history." },
-      "reviewTools": { "type": "string", "default": "read,grep,glob", "description": "Comma-separated extension reviewer tool grants; blank grants none. Supported: read,grep,glob,recall,lsp,web_search,bash,eval,edit,write,ast_edit,debug. Unavailable selected tools fail explicitly; command/mutation tools are not sandboxed and retain OMP approvals." },
-      "reviewInstructions": { "type": "string", "default": "", "description": "Saved multiline extension reviewer instructions; at most 8192 UTF-8 bytes, with tab/newline/carriage return as the only permitted controls." },
-      "reviewHistoryTurns": { "type": "number", "default": 3, "min": 0, "max": 8, "step": 1, "description": "Completed prior review summaries kept in this session (0 disables, at most 8 and 16 KiB total); not persistent native advisor history." },
-      "credentialMode": { "type": "enum", "values": ["azure-cli", "default"], "default": "azure-cli", "description": "Azure CLI identity (az login) or Azure SDK DefaultAzureCredential; credentials are never stored." },
-      "passThreshold": { "type": "number", "default": 0.8, "min": 0.5, "max": 1, "step": 0.01, "description": "Required pass probability; lower means fewer reviews, higher is stricter." },
-      "timeoutMs": { "type": "number", "default": 10000, "min": 100, "max": 20000, "step": 1, "description": "Per-turn scoring deadline in milliseconds, including authentication and response reading." },
-      "advisorTimeoutMs": { "type": "number", "default": 20000, "min": 100, "max": 20000, "step": 1, "description": "Automatic extension reviewer deadline in milliseconds." }
-    }
-  },
+  "engines": { "node": ">=22.19.0" },
+  "pi": { "extensions": ["src/index.ts"] },
   "scripts": {
     "check": "tsc --noEmit",
     "test": "tsx --test test/*.test.ts",
     "deploy": "tsx deploy/cli.ts",
     "probe": "tsx scripts/probe.ts",
-    "omp": "tsx scripts/omp.ts"
+    "pi": "tsx scripts/pi.ts"
   },
-  "dependencies": {
-    "@azure/identity": "4.13.0"
-  },
+  "dependencies": { "@azure/identity": "4.13.0" },
   "peerDependencies": {
-    "@oh-my-pi/pi-coding-agent": "18.8.7",
-    "@oh-my-pi/pi-natives": "18.8.7",
-    "@oh-my-pi/pi-tui": "18.8.7"
-  },
-  "peerDependenciesMeta": {
-    "@oh-my-pi/pi-coding-agent": { "optional": true },
-    "@oh-my-pi/pi-natives": { "optional": true },
-    "@oh-my-pi/pi-tui": { "optional": true }
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-agent-core": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
   },
   "devDependencies": {
-    "@oh-my-pi/pi-ai": "18.8.7",
-    "@oh-my-pi/pi-coding-agent": "18.8.7",
-    "@oh-my-pi/pi-natives": "18.8.7",
-    "@oh-my-pi/pi-tui": "18.8.7",
+    "@earendil-works/pi-ai": "0.99.2",
+    "@earendil-works/pi-agent-core": "0.99.2",
+    "@earendil-works/pi-coding-agent": "0.99.2",
+    "@earendil-works/pi-tui": "0.99.2",
     "@types/node": "22.19.15",
     "tsx": "4.21.0",
     "typescript": "5.9.3"

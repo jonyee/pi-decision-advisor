@@ -1,9 +1,6 @@
-import { execFile } from "node:child_process";
 import { delimiter, resolve } from "node:path";
-import { promisify } from "node:util";
-import { normalizeDecisionSettings, type DecisionSettings } from "../src/config.js";
-
-const execute = promisify(execFile);
+import type { DecisionSettings } from "../src/config.js";
+import { loadDecisionSettings, type DecisionSettingsOptions } from "../src/settings.ts";
 
 export class SettingsSetupError extends Error {
   constructor(message: string) {
@@ -12,55 +9,44 @@ export class SettingsSetupError extends Error {
   }
 }
 
-/** npm prepends the SDK source CLI, which needs Bun rather than standalone Node. */
-export function installedOmpEnvironment(): NodeJS.ProcessEnv {
+/** Prefer the installed Pi CLI to npm's injected package-local executable directory. */
+export function installedPiEnvironment(): NodeJS.ProcessEnv {
   const environment = { ...process.env };
   environment.PATH = (environment.PATH ?? "").split(delimiter)
     .filter(directory => !/[\\/]node_modules[\\/]\.bin[\\/]?$/.test(directory)).join(delimiter);
   return environment;
 }
 
-/** Probe flags use the same profile and project selection as an OMP launch. */
-function settingsContext(args: readonly string[]): { cwd: string; profileArgs: string[] } {
+function settingsContext(args: readonly string[]): { cwd: string; options: DecisionSettingsOptions } {
   let cwd = process.cwd();
-  let profile: string | undefined;
+  const options: DecisionSettingsOptions = {};
   for (let index = 0; index < args.length; index++) {
     const arg = args[index]!;
+    if (arg === "--trust-project") {
+      options.projectTrusted = true;
+      continue;
+    }
     const equal = arg.indexOf("=");
     const flag = equal < 0 ? arg : arg.slice(0, equal);
-    if (flag !== "--profile" && flag !== "--cwd") {
-      throw new SettingsSetupError("Probe accepts only --profile <name> and --cwd <directory>; use the same values as your OMP launch.");
+    if (flag !== "--agent-dir" && flag !== "--cwd") {
+      throw new SettingsSetupError("Probe accepts --cwd <directory>, --agent-dir <directory> and --trust-project; use the same project and Pi agent directory as your Pi launch.");
     }
     const value = equal < 0 ? args[++index] : arg.slice(equal + 1);
-    if (!value || (flag === "--profile" && value.startsWith("-"))) {
-      throw new SettingsSetupError("Provide a value for --profile or --cwd; use the same profile and project directory as your OMP launch.");
+    if (!value || value.startsWith("--")) {
+      throw new SettingsSetupError("Provide a directory value for --cwd or --agent-dir.");
     }
-    if (flag === "--profile") profile = value;
+    if (flag === "--agent-dir") options.agentDir = resolve(process.cwd(), value);
     else cwd = resolve(process.cwd(), value);
   }
-  return { cwd, profileArgs: profile === undefined ? [] : ["--profile", profile] };
+  return { cwd, options };
 }
 
-/** Read the host's store without importing its Bun-dependent SDK or writing config files. */
+/** Read extension-owned preferences directly; project files require explicit trust. */
 export async function readStoredDecisionSettings(args: readonly string[] = []): Promise<DecisionSettings> {
-  const { cwd, profileArgs } = settingsContext(args);
-  let stdout: string;
+  const { cwd, options } = settingsContext(args);
   try {
-    // `list` precedes the plugin name. Plugin commands do not accept --cwd;
-    // their PluginManager resolves project overrides from the subprocess cwd.
-    ({ stdout } = await execute("omp", [...profileArgs, "plugin", "config", "list", "omp-decision-advisor", "--json"], {
-      cwd, env: installedOmpEnvironment(), shell: false, timeout: 30_000, maxBuffer: 1024 * 1024,
-    }));
+    return await loadDecisionSettings(cwd, options);
   } catch {
-    throw new SettingsSetupError("Cannot read OMP plugin settings. Install a compatible OMP binary, make omp-decision-advisor discoverable with omp plugin link <local-plugin-directory> in the selected profile, then launch npm run omp -- with the same --profile/--cwd flags and configure /decision. Raw CLI diagnostics are suppressed.");
-  }
-  try {
-    const result: unknown = JSON.parse(stdout);
-    if (result === null || typeof result !== "object" || Array.isArray(result) || !("settings" in result)) throw new Error();
-    const settings = result.settings;
-    if (settings === null || typeof settings !== "object" || Array.isArray(settings)) throw new Error();
-    return normalizeDecisionSettings(settings as Record<string, unknown>);
-  } catch {
-    throw new SettingsSetupError("OMP returned invalid decision settings. Open /decision in the same profile/project to save valid provider, model, threshold and timeout settings; raw settings and diagnostics are suppressed.");
+    throw new SettingsSetupError("Cannot read valid Decision preferences. Open /decision settings in the same Pi agent directory and project to save valid provider, model, threshold and timeout settings. Project overrides are used only with --trust-project; raw settings and diagnostics are suppressed.");
   }
 }

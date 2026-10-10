@@ -1,132 +1,142 @@
-# OMP Decision advisor
+# Pi Decision advisor
 
-Microsoft-Decision-1 on Azure Foundry reviews every completed **primary model turn**, including tool-loop turns. Passing turns are silent. A failed triage check automatically starts a configurable **extension escalation reviewer**; only failures and their review are displayed. This is not OMP's native advisor runtime: choosing `@advisor` selects its model role, not its watchdog tools, scheduling or delivery machinery.
+Microsoft-Decision-1 on Azure Foundry reviews every completed **primary model turn**, including tool-loop turns. Passing turns are silent. Failed or unassessed turns automatically start a separately configured tool-capable reviewer. Findings are advisory context for the primary's next natural request; feedback never requests another primary turn.
 
-The extension and Azure deployment tooling share this repository. No Nix configuration changes are required.
+This is a **stock pi.dev extension**, using `@earendil-works/pi-*`. No OMP fork or native advisor subsystem is required. The Azure deployment utilities remain in this repository.
 
 ## Install
 
-Requires OMP **18.8.7**. Its Git installer needs external Bun on `PATH`:
+Requires **Pi 0.99.2 or newer** and Node **22.19+**. Development dependencies and runtime verification target stock Pi 0.99.2; Pi 1.1.0 exposes the same required APIs.
 
 ```sh
-omp install github:jonyee/omp-decision-advisor
+pi install git:github.com/jonyee/omp-decision-advisor
 ```
 
-On Nix, without changing host configuration:
-
-```sh
-nix shell nixpkgs#bun --command omp install github:jonyee/omp-decision-advisor
-```
-
-For a local checkout:
+The repository URL retains its original name; the package is now `pi-decision-advisor`. For a checkout:
 
 ```sh
 npm ci --ignore-scripts
-omp install /path/to/omp-decision-advisor
+pi install /path/to/omp-decision-advisor
 ```
 
-Restart OMP after installation. Uninstall with `omp plugin uninstall omp-decision-advisor`.
+Restart Pi or reload extensions after installation. Remove with `pi remove <installed-source>`.
 
-The extension archive ships `src/`, `package.json` and this README. Azure Identity is its only external runtime dependency; the host supplies the SDK and tokenizer. Optional peers pin the supported OMP version without installing another OMP runtime. Native TypeScript loading needs no extension build step. `private: true` prevents npm-registry publication; GitHub installation still works. No redistribution license has been selected.
+Pi supplies the agent, model and TUI packages; they are peers, not bundled runtime copies. Azure Identity is the only external runtime dependency. The archive includes `src/`, the manifest and this README. TypeScript loads directly without an extension build. `private: true` prevents npm-registry publication; Git installation still works. The extension has no selected redistribution license.
 
-For an archive, run `npm pack --ignore-scripts` in the checkout, then:
+For a tarball, first install it with npm into a private directory, then `pi install` that package directory:
 
 ```sh
-npm install --ignore-scripts --omit=dev \
-  --prefix "$HOME/.local/share/omp-decision-extensions" \
-  /path/to/omp-decision-advisor-0.5.0.tgz
-omp install "$HOME/.local/share/omp-decision-extensions/node_modules/omp-decision-advisor"
+npm pack --ignore-scripts
+npm install --ignore-scripts --omit=dev --legacy-peer-deps \
+  --prefix "$HOME/.local/share/pi-decision-extensions" \
+  /path/to/pi-decision-advisor-0.7.0.tgz
+pi install "$HOME/.local/share/pi-decision-extensions/node_modules/pi-decision-advisor"
 ```
 
-OMP treats local install targets as directories to link, not tarballs: install the archive with npm first.
+## Configure
 
-## Configure in OMP
+Run `/decision` for **on**, **off**, **status**, and **settings**. Select both an existing Azure scoring deployment and an authenticated Pi reviewer model. The reviewer starts unconfigured: there is no implicit primary-model fallback and no `@advisor` alias.
 
-Run `/decision` to open the control menu: **on**, **off**, **status**, and **settings**. On/off is saved per active OMP profile and applies immediately; off cancels in-flight automatic work and prevents turn scoring or escalation reviews. Existing profiles remain on by default. Choose **settings** to open the preference editor below.
-
-| Preference | Purpose |
+| Preference | Contract |
 |---|---|
-| Scoring model | Choose a healthy existing Microsoft-Decision-1 Azure deployment, or enter its endpoint and deployment manually |
-| Reviewer model | Choose an authenticated OMP chat model, explicit selector, or the `@advisor` model role |
-| Tools | Explicit grants; initially `read,grep,glob`; blank means no tools |
-| Instructions | Additional multiline reviewer preferences, up to 8192 UTF-8 bytes; never put credentials here |
-| Review history entries | Retain up to 3 completed prior-review summaries by default; integer 0–8, with 0 disabling history |
-| Azure credentials | Azure CLI identity (`az login`, recommended locally), or `DefaultAzureCredential` |
-| Pass threshold | Start at `0.8`; allowed `0.5`–`1`; lower means fewer escalations, higher is stricter |
-| Scoring timeout | Authentication and inference deadline; initially 10000 ms, allowed 100–20000 ms |
-| Automatic reviewer timeout | Review deadline; initially 20000 ms, allowed 100–20000 ms |
-| Verbose output | Off by default; show passing scores, complete scoring/review JSON and reviewer-request progress when on |
+| Automatic review | On by default; off cancels outstanding extension work and disables automatic scoring/review |
+| Scoring model | Healthy existing Microsoft-Decision-1 Azure deployment, or manual account HTTPS origin and deployment name |
+| Reviewer model | Explicit available Pi `provider/model` ID; blank means unconfigured |
+| Tools | Initially `read,grep,find`; blank grants none |
+| Instructions | Multiline reviewer preferences, at most 8192 UTF-8 bytes; never enter credentials |
+| Review history entries | At most 3 completed prior summaries by default; integer 0–8; 0 disables |
+| Azure credentials | Azure CLI identity (`az login`) or `DefaultAzureCredential` |
+| Pass threshold | Initially 0.8; range 0.5–1; lower means fewer escalations |
+| Scoring timeout | Initially 10000 ms; range 100–20000 ms, covering authentication and inference |
+| Reviewer timeout | Initially 20000 ms; range 100–20000 ms, including tool approvals |
+| Verbose output | Off by default; shows passing scores and full sanitized Decision reports, not reviewer JSON |
 
-**Save** persists the draft in OMP's existing plugin settings store, then applies it immediately to the running extension. **Cancel** makes no changes. Changing settings cancels outstanding old-configuration work and clears the old latest-turn report.
+**Save** persists validated user preferences and applies effective values immediately. **Cancel** discards the draft. Settings changes clear latest-turn capture and in-memory review history and cancel old-configuration work.
 
-The Tools picker can grant `read`, `grep`, `glob`, `recall`, read-only `lsp`, `web_search`, `bash`, `eval`, `edit`, `write`, `ast_edit` and `debug`. Enabling command-execution/mutating tools requires an immediate confirmation and an elevated-grant warning at final Save. Cancel in the picker discards its draft. Selecting `recall` requires an existing Hindsight/Mnemopi bank; `lsp` requires configured servers; web/code/debug tools retain their normal host prerequisites. Missing selected tools produce an explicit review error **before** a model call, rather than silently dropping grants. MCP, ambient extensions, IRC and subagent spawning remain disabled.
+User preferences live at `getAgentDir()/decision-advisor.json`, normally `~/.pi/agent/decision-advisor.json`. `PI_CODING_AGENT_DIR` selects a different Pi agent directory. Writes use an atomic replacement and mode 0600 on POSIX. `.pi/decision-advisor.json` project overrides are read only when Pi reports the project trusted. They are never edited by the menu; Save warns when they shadow user values. External file edits apply on the next session/reload.
 
-The reviewer uses the main session's normal OMP approval settings in a nonpersistent overlay; tool grants do not bypass approval. Headless calls that cannot obtain a required approval fail closed. Fresh tool results remain secret-obfuscated, even if the primary did not enable obfuscation. A reviewer with `bash`, `eval`, `write`, `edit`, `ast_edit` or `debug` can affect files/processes/external resources when approval permits it; this is not a sandbox. Default grants remain read-only. Read-only `lsp` cannot perform refactors or formatting.
+No OMP plugin settings or custom `DECISION_*` variables are read. Existing OMP preferences are not automatically imported. Copy only desired non-secret settings, replace `@advisor` with an explicit Pi model ID and `glob` with `find`, and remove unsupported OMP grants.
 
-History contains only completed review summaries: primary turn number, user request and validated findings/verdict. It is in memory, sorted by primary turn, and capped at both the configured entry count and **16384 serialized UTF-8 bytes**. Old/oversized entries are omitted whole, never truncated. A review receives only already-completed earlier turns; concurrent reviews do not see each other's unfinished work. Settings changes, on/off, branching, compaction, session switches and shutdown clear history. There is no cross-session replay or retained native advisor/tool transcript.
+### Reviewer tools and approval
 
+Supported stock tools: `read`, `grep`, `find`, `ls`, `bash`, `edit`, `write`, plus `powershell` on Windows. `grep` requires `rg`; `find` requires `fd` or `fdfind`. Missing requested prerequisites fail **before inference**, without downloading tools or silently dropping grants. OMP-only tools such as `recall`, `lsp`, `web_search`, `eval`, `ast_edit` and `debug` are not aliases or inherited integrations.
 
-Preferences live under `settings["omp-decision-advisor"]` in the active profile's `omp-plugins.lock.json`; the default layout is `~/.omp/plugins/omp-plugins.lock.json`. Named profiles and initialized XDG layouts use OMP's normal paths. Project plugin overrides retain OMP's normal precedence; the UI warns if they shadow a saved profile value and reloads the effective values.
+The reviewer is a separate in-memory Pi Agent with only the selected tools and explicit prompt. It discovers no ambient extensions, MCP, skills, rules or subagents. Its model calls use `ctx.modelRegistry.streamSimple()`, preserving Pi's configured provider credentials and headers.
 
-No custom `DECISION_*` environment variables are read. Old shell exports can be removed. Endpoints and model choices stay in local OMP configuration, not this public repository. Tokens, API keys and passwords are never saved. API-key authentication is not supported by the verified System One contract.
+Elevated grants require confirmation in the picker and a warning at Save. **Every actual `bash`, `powershell`, `edit` or `write` operation also requires fresh TUI/RPC confirmation.** Headless execution is denied. A denied or failed tool prevents the reviewer from reporting a successful review. Pi does not inherit OMP approval settings; this extension owns the reviewer approval gate.
 
-Deployment discovery is read-only and happens only when selected in the UI. A focused loading modal stays visible while Azure is queried; Enter and typed text cannot reach the main editor. Escape cancels the Azure CLI subprocess and returns to preferences; late results do not reopen a picker. It uses Azure CLI's active subscription and account read permissions, and never creates or changes Azure resources. Without discovery access, enter the existing account HTTPS origin and deployment manually. Do not append `/providers/microsoft/v1/systemone` to the endpoint; the client adds it.
+Tool grants are **not a sandbox**. Approved tools run with the Pi process's permissions and can affect files, processes or external resources. Cancellation fences late approvals and pending file commits and kills running shell process groups; it cannot undo completed actions or guarantee control over intentionally detached/external work.
 
-Azure CLI mode uses your existing `az login` identity without an extra credential-selection variable. DefaultAzureCredential mode supports Azure SDK's standard managed/workload/environment identity mechanisms. Inference still requires existing data-plane permissions and network access. The extension never grants roles or changes authentication/network policies.
+### Secret protection
 
-Commands:
+Before Decision inference, conversation evidence is irreversibly redacted. Reviewer requests, fresh tool content/details/structured results, provider output, findings and retained summaries are redacted too; placeholders are never restored.
 
-- `/decision` — open the on/off/status/settings control menu.
-- `/decision on` / `/decision off` — persist the automatic-review state; explicit diagnostics remain available when off.
-- `/decision settings` — edit saved provider, reviewer model, tools, instructions, history, triage and timeout preferences.
-- `/decision status` — show current configuration and latest stored scores, and perform a live smoke test. It sends one batched request with a matching and mismatching synthetic reply against a supplied arithmetic reference; it never sends conversation history or invokes the escalation reviewer. A wrong classification is a failed smoke; network/authentication/malformed-response failures are errors, not passes. It works while automatic review is off, is cancellable in the TUI, and incurs one small model request when configured. An unconfigured provider is reported without making a request. This is a functional smoke, not general quality calibration.
-- `/decision review` — show/reuse the automatically requested review, or explicitly review a captured passing turn. It does not issue a duplicate review for the same captured turn.
-- `/decision verbose` — toggle saved verbose output; `/decision verbose on` / `/decision verbose off` set it explicitly. This applies immediately and clears old-configuration review state, like other settings changes.
+Initialization reads only local sensitive environment values, literal configured credentials/headers and stored Pi access/refresh/key values. It does not refresh authentication, execute configured credential commands, log in or contact providers. Pattern detection covers common vendor credentials, private keys, authorization headers, credential assignments, URL passwords and signed-URL secrets.
 
-For headless administration, use OMP's existing plugin configuration CLI:
+This is best-effort redaction, **not proof that arbitrary secrets can never escape**. Unknown credentials without recognizable context can remain undetected. Evidence intentionally includes conversation text, instructions and tool results; do not enable cloud scoring for material that must never leave the machine.
 
-```sh
-omp plugin config set omp-decision-advisor passThreshold 0.8
-omp plugin config set omp-decision-advisor reviewModel @advisor
-omp --profile work plugin config list omp-decision-advisor --json
+### Azure discovery and authentication
+
+Deployment discovery is explicitly requested and read-only. In the TUI, its loading modal owns input focus; Escape cancels the subprocess, and late results cannot reopen a picker. RPC uses native dialogs and direct bounded operations, not custom terminal components. Without cloud discovery permission, enter the existing account HTTPS origin and deployment manually. Do not append `/providers/microsoft/v1/systemone`; the client adds it.
+
+Azure CLI authentication uses the signed-in `az login` identity. DefaultAzureCredential supports standard Azure SDK managed/workload/environment identity mechanisms. Inference still requires existing data-plane permissions and network access. The extension never grants roles or changes Azure security/network policy. Azure API-key authentication is not supported by this System One client; tokens and API keys are never saved in preferences.
+
+### Commands
+
+- `/decision` — four-action control menu.
+- `/decision on` / `/decision off` — persist automatic review state. Explicit diagnostics remain available while off.
+- `/decision settings` — deployment, reviewer, tool grants, instructions, history and triage preferences.
+- `/decision status` — configuration, latest scores and **one batched synthetic matching/mismatching arithmetic smoke request** when configured. No conversation history or reviewer invocation. Wrong classification fails; auth/network/malformed responses are errors. TUI-cancellable; available while off.
+- `/decision review` — reuse the captured automatic review, or explicitly review a captured passing turn. Reuse does not duplicate model calls or transcript entries.
+- `/decision verbose [on|off]` — toggle/set saved verbose output.
+
+A turn is captured only when automatic scoring is enabled. Status remains available without a captured turn.
+
+## Failure policy and scheduling
+
+All five independent rubric questions—adherence, groundedness, correctness, safety and progress—are sent in **one Azure System One request per primary assistant turn**:
+
+```text
+POST {endpoint}/providers/microsoft/v1/systemone
+Authorization: Bearer <Azure Identity token>
+{ model: deployment, state: serializedEvidence, questions: fiveRubrics }
 ```
 
-Configuration listings can expose your local account endpoint; use a private terminal. Use the same profile and project directory as the OMP session. The next session reads external CLI changes; `/decision` applies its own Save immediately.
+This is direct classification, not a chat-completions provider. A turn fails triage if any verdict is `concern`, `blocker` or `cannot_tell`, or `P(pass)` is below the configured threshold. Equality passes. The starting 0.8 threshold is not a calibrated correctness guarantee. Scoring failures remain **not evaluated**, and invoke review without a score; reviewer failures never become accepts. If secret protection fails, no raw evidence is sent.
 
-## Failure policy and request count
+Scoring is awaited in Pi's `turn_end`. Reviewer work can overlap later primary tool-loop turns; `agent_before_settle` waits for outstanding reviews. Generation and abort signals prevent cancelled work from publishing late results. The extension never sets `continue: true`, steers the primary, changes its model, approves primary actions or invokes a native watchdog.
 
-All five independent rubric questions—adherence, groundedness, correctness, safety and progress—are batched into **one Decision-1 request per primary turn**. There are not five separate model requests. A user request may involve several tool-loop turns, each with its own review.
+Reviews may accept first-stage flags that investigation does not confirm. Tool-enabled reviews can make multiple chat-model requests; passing turns make no reviewer requests. The owner reports an endpoint allowance of 17 requests/second. The extension does not change quota, deployment capacity or rate limits.
 
-A turn fails triage if **any** criterion has a non-`pass` verdict (`concern`, `blocker` or `cannot_tell`), or its `P(pass)` falls below the configured threshold. Equality passes: `P(pass) == threshold` is sufficient when the verdict is `pass`.
+History contains only completed earlier-turn summaries, sorted by primary turn, capped at the configured count and **16384 serialized UTF-8 bytes**. Oversized/old entries are omitted whole, not truncated. Concurrent reviews never see unfinished summaries. Settings changes, on/off, branching, compaction, session changes and shutdown clear this in-memory reviewer history.
 
-`0.8` is a conservative starting triage threshold, not a calibrated guarantee. Try `0.7` if representative examples show too many low-confidence false alarms; increasing the threshold is stricter. Explicit non-pass verdicts still escalate regardless of the threshold. Missing evidence is uncertainty, not proof of a defect.
+## Transcript and output
 
-With verbose off, passing scores are retained in ordinary OMP session entries but produce no automatic output. A failure displays its scores and requests the escalation reviewer. An accepted review replaces that turn's panel with just **“The advisor was requested but had no findings.”** Reviews with findings use advisor-style severity badges and note rails, followed by evidence and recommendations—not JSON. An uncertain review without findings says that the advisor could not determine whether a correction is needed. Scoring errors remain **not evaluated**, and reviewer errors never become accepts.
+Scores, scoring errors and review results are durable **Pi custom session entries** with extension-owned renderers. Passing score entries render nothing unless verbose. Failed scores appear before reviewer notes and stay visible during delayed review; no temporary widget replaces them. Findings carry severity, evidence and recommendation. Collapsed reviews show three findings; **Ctrl+O** expands the remainder. Empty accepted/uncertain reviews display explicit notices.
 
-The escalation reviewer may accept a flagged turn: that means the first-stage flag was not confirmed. Findings are displayed and queued as advisory context for the primary's next natural turn. The extension does not automatically restart the primary, approve an action or change its model. Tools, additional instructions and bounded review summaries are configurable above; native `WATCHDOG.yml` grants, native advisor history, severity-based steering and native advisor recovery are not inherited. OMP itself needs no patch or replacement.
+Scores/errors never enter model context. Persisted reviews are projected as advisory custom context on later natural requests only while their source assistant entry remains in the current projected context. Branching, compaction or context edits do not resurrect omitted source turns. The canonical primary transcript still ends in its answer, preserving stock Pi's print behavior.
 
-An escalation review requires a separate model invocation because it depends on Decision-1's result and uses a different model. Investigation can require further reviewer model calls after tool results. Passing turns have no escalation calls. The current endpoint allowance reported by the owner is **17 requests/second**; count one Decision-1 request per primary turn, not one per criterion. The extension does not alter capacity or quota.
+In **text print mode**, the primary answer remains on stdout; Pi routes extension score/review/status diagnostics to stderr. In **JSON mode**, standard `entry_appended` events retain full structured Decision reports and review results regardless of verbose presentation. No private Pi stdout APIs or patched native advisor events are used.
 
-Both scoring and automatic review are bounded below OMP's 30-second hook budget. Separate finalization gates wait for outstanding scoring and reviewer work. Feedback initially appears above the input while idle. Panels longer than six rendered lines collapse to a preview; **Ctrl+O** uses OMP's native expansion state to show/hide all lines, alongside normal tool-output expansion. When the next user-driven primary turn starts, the completed panel is injected into the scrolling transcript through the awaited `before_agent_start` hook, then removed from the input area. It is never queued during the previous shutdown, so presentation does not start an extra primary turn. Display-only feedback is excluded from provider/judge context; actionable findings enter separately.
+Evidence includes the current standing prompt, latest user request, up to eight recent projected messages, current assistant output and tool results. Attachments are explicitly unavailable to the text-only judge. Without OMP's native tokenizer, the extension and standalone probe share the client's conservative **28000 serialized UTF-8 byte** evidence budget, reserving room for rubrics within Decision-1's published 32768-token context. This is an application allowance, not a model-token count. Oversized evidence is rejected, never silently truncated. Review is post-turn and cannot prevent a tool action already executed.
 
-Verbose mode preserves the normal scoring/review output plus complete sanitized report/result JSON and reviewer-request progress. It also prints passing score reports, without requesting a reviewer for them. In ordinary print mode, accepted reviews are a plain note and findings are plain structured notes; full reviewer JSON is shown only when verbose. Protocol JSON mode retains structured records for machine consumers regardless of presentation preference. Provider tokens, raw upstream errors and conversation evidence are not printed by verbose mode. Full validated scores/results remain in OMP custom session entries.
+## Checkout utilities and deployment
 
-
-Review is post-turn and cannot prevent a tool action that already happened. Evidence includes standing instructions, the latest user request, up to eight recent messages, and the current assistant/tool results. OMP's Qwen tokenizer limits evidence to 24000 tokens, reserving space within the model's 32768-token context for rubrics. The standalone client uses a stricter 28000-byte budget without a host tokenizer. Oversized evidence is rejected rather than silently truncated. Attachments are explicitly unavailable to this text-only judge.
-
-## Checkout utilities and Azure deployment
-
-The launcher, probe and deployment tooling are repository-only utilities, excluded from the extension archive. Requires Node 22+, npm and Azure CLI for cloud operations.
+The launcher, probe and Azure deployment CLI are checkout-only utilities, excluded from the extension archive.
 
 ```sh
 npm ci --ignore-scripts
-npm run omp -- --cwd /path/to/workspace
-npm run omp -- --profile work --cwd /path/to/workspace
+npm run pi -- --version
+npm run pi
+npm run probe -- --cwd /path/to/workspace --agent-dir /path/to/pi-agent
+# Add --trust-project only to include a reviewed .pi/decision-advisor.json override.
 ```
 
-The development launcher explicitly loads this local extension and suppresses ambient extension discovery so an installed copy cannot run a duplicate review. Explicit additional `-e` paths still work. Use ordinary `omp` for your normal installed extension roster. `/decision` configures the selected profile; the launcher does not guess an Azure resource or read custom runtime variables.
+Run the launcher from the intended workspace using an absolute path to `scripts/pi.ts` when necessary; Pi does not support OMP's `--cwd` or `--profile` flags. The launcher explicitly loads this extension and disables discovery, avoiding an installed duplicate. Explicit additional `-e` paths still work. Use ordinary `pi` for the normal extension roster.
 
-Deployment tooling reuses an existing healthy `AIServices` account. It queries live model catalog/quota, creates only the requested Microsoft-Decision-1 deployment, or reuses an exact healthy match:
+The probe reads the same extension-owned preferences, sends public synthetic correct arithmetic versus wrong arithmetic/fabricated tests, prints sanitized judgments and exits nonzero unless discrimination is demonstrated. It is not general quality calibration.
+
+Deployment tooling reuses existing healthy `AIServices` accounts and queries live model catalog/quota:
 
 ```sh
 npm run deploy -- list
@@ -134,9 +144,9 @@ npm run deploy -- plan --location eastus2 --sku DataZoneStandard --capacity 17
 npm run deploy -- apply --location eastus2 --sku DataZoneStandard --capacity 17
 ```
 
-It never creates accounts/resource groups, grants permissions, changes network/authentication settings or deploys an advisor model. Mismatched existing model/version/SKU/capacity is rejected rather than overwritten. Intentional resizing remains an explicit Azure operation. Azure's create API is create-or-update; do not deploy the same name concurrently elsewhere. `list --show-identifiers` reveals resource names only when explicitly requested. After deployment, choose it through `/decision`; the obsolete environment-export command was removed.
+It creates only the requested Microsoft-Decision-1 deployment or reuses an exact healthy match. It never creates accounts/resource groups, grants permissions, changes authentication/network settings or deploys the reviewer model. Conflicting existing version/SKU/capacity is rejected, not overwritten. Azure's create API is create-or-update; do not deploy the same name concurrently. `list --show-identifiers` reveals resource names only explicitly. The existing default deployment name `omp-decision-1` is retained to avoid renaming cloud resources during this host cutover; select the actual existing deployment in `/decision settings`.
 
-DataZoneStandard limits processing to the selected data zone rather than one region. This is pay-as-you-go, not a reserved-throughput SKU. Microsoft lists $0.042 per million input tokens; advisor costs depend on its OMP provider. Automatic escalation incurs advisor charges on failed/unassessed turns.
+DataZoneStandard limits processing to a data zone, not one region. It is pay-as-you-go, not reserved throughput. Microsoft's introduction lists $0.042 per million input tokens; verify current pricing and quota before deployment. Reviewer charges depend on the selected Pi provider.
 
 ## Verification
 
@@ -144,22 +154,25 @@ DataZoneStandard limits processing to the selected data zone rather than one reg
 npm run check
 npm test
 npm run probe
-npm run probe -- --profile work --cwd /path/to/workspace
 ```
 
-The probe reads the same persisted OMP settings through its configuration CLI. The plugin must be discoverable in that profile; use `omp plugin link /path/to/omp-decision-advisor` for a local checkout. The probe supplies synthetic correct arithmetic evidence versus wrong arithmetic and fabricated tests, prints sanitized judgments only and exits nonzero unless it demonstrates discrimination. It is not general task-quality calibration.
+Stock Pi 0.99.2 CLI smokes used a local TLS System One fixture with the real Azure Identity CLI path and deterministic chat providers. They exercised batched tool-loop scoring, selected-tool file reads, evidence/tool-result redaction, scores-before-notes, findings in the next natural prompt, silent passing output, accepted-review print output, headless mutation denial and status smoke while off. Two prompts with a primary file-read loop produced three primary calls, with no feedback-triggered calls.
 
-Integration verification exercised the native `/decision` controls/preferences in an isolated OMP profile. With live Azure Decision-1 scoring and deterministic local chat fixtures, passing turns stayed silent and failed turns invoked the escalation reviewer. The reviewer executed a real file read, received only selected tools and saved instructions, used completed earlier summaries and cleared them on settings reset. Two user prompts produced exactly two primary model calls; feedback did not start hidden turns.
+Actual Pi TUI verification covered the four-action menu, preference cancellation, retained scores, three-finding collapse, Ctrl+O expansion, status smoke, focused loading cancellation, blocked main-editor input during loading and persisted off state. Actual RPC verification covered approved mutation, denial, review timeout, abort and late approval fencing. TypeScript checking and all 136 behavioral tests pass. These are local deterministic checks, **not live Azure inference or reviewer-quality calibration**.
 
-Additional native TUI verification covered the four-action control menu, a focused loading state during delayed deployment discovery, ignored main-editor input while loading, Escape cancellation with subprocess termination, and safe manual-entry fallback on query errors. Live `/decision status` smoke passed against Azure while automatic review was off; off/on transitions survived restarts and restored automatic review only when enabled.
+## Changes
 
-Expanded-reviewer TUI verification covered declined elevated grants, picker cancellation, explicit elevated confirmation at Save, multiline instructions and history tuning. A user-granted `write` changed only a temporary smoke file; inherited `always-ask` approval prevented that mutation in a headless run. Fresh read results honored configured secret redaction. An unavailable `recall` grant failed before the reviewer model was called, and explicit empty grants exposed no tools.
+### 0.7.0
 
-Presentation verification exercised the actual native TUI advisor-style notes and six-line preview, Ctrl+O expansion without overriding the built-in shortcut, concise accepted-review notes, and transfer into scrolling output at the next user boundary. RPC and print-mode smokes exercised accepted/actionable review formatting and saved verbose controls. Live Azure scoring showed passing reports only in verbose mode; verbose escalation included a request-progress note and full accepted result. Type checking and 117 regression tests passed.
+- Clean cutover to stock Pi packages, lifecycle boundaries and extension-owned transcript rendering; no OMP host fork.
+- Extension-owned private preferences with trusted read-only project overrides and explicit reviewer model IDs.
+- Isolated selected-tool reviewer, per-operation elevated approval, fail-closed headless execution and one-way secret redaction.
+- Pi launcher/probe configuration and behavioral regression coverage for host integration, cancellation, approvals and persistence.
 
 ## Sources
 
 - [Microsoft model specification](https://ai.azure.com/catalog/models/Microsoft-Decision-1)
-- [Foundry System One example and pricing](https://techcommunity.microsoft.com/blog/azure-ai-foundry-blog/introducing-microsoft-decision-1-in-microsoft-foundry-for-decision-and-classific/4562742)
+- [Foundry System One introduction and pricing](https://techcommunity.microsoft.com/blog/azure-ai-foundry-blog/introducing-microsoft-decision-1-in-microsoft-foundry-for-decision-and-classific/4562742)
 - [Azure deployment CLI](https://learn.microsoft.com/en-us/cli/azure/cognitiveservices/account/deployment)
-- [OMP extensions](https://github.com/can1357/oh-my-pi/blob/v18.8.7/docs/extensions.md)
+- [Pi extensions](https://github.com/earendil-works/pi/blob/v1.1.0/packages/coding-agent/docs/extensions.md)
+- [Pi packages](https://github.com/earendil-works/pi/blob/v1.1.0/packages/coding-agent/docs/packages.md)

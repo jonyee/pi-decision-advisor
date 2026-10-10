@@ -28,7 +28,7 @@ function sanitized(report: DecisionReport) {
 try {
   const settings = await readStoredDecisionSettings(process.argv.slice(2));
   if (!settings.endpoint || !settings.deployment) {
-    throw new SettingsSetupError("Decision scoring is not configured. Launch npm run omp -- with the same --profile/--cwd flags and use /decision to select an existing provider deployment before running this probe.");
+    throw new SettingsSetupError("Decision scoring is not configured. Launch npm run pi -- in the same project and Pi agent directory, then use /decision to select an existing provider deployment. This probe accepts --cwd, --agent-dir and --trust-project for trusted project overrides.");
   }
   const client = new AzureDecisionClient(toDecisionOptions(settings));
   const positive = await client.evaluate(good, 1);
@@ -52,7 +52,7 @@ try {
     console.error(error.message);
   } else {
     const code = error instanceof DecisionError ? error.code : "configuration";
-    console.error(`Azure decision probe failed (${code}); check /decision in the same OMP profile/project, selected credential mode, identity access and deployment without sharing credentials.`);
+    console.error(`Azure decision probe failed (${code}); check /decision in the same Pi agent directory/project, selected credential mode, identity access and deployment without sharing credentials.`);
   }
   process.exitCode = 1;
 }

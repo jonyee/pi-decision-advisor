@@ -1,7 +1,5 @@
-import { Container, Text } from "@oh-my-pi/pi-tui";
-import { countTokens, Encoding } from "@oh-my-pi/pi-natives";
-import { getAgentDir, getMarkdownTheme, Markdown, type ExtensionAPI, type ExtensionContext } from "@oh-my-pi/pi-coding-agent";
-import { buildSecretObfuscator, type SecretObfuscator } from "@oh-my-pi/pi-coding-agent/secrets";
+import { Container, Text } from "@earendil-works/pi-tui";
+import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import { AzureDecisionClient, DecisionError } from "./decision.ts";
 import { toDecisionOptions, type DecisionSettings } from "./config.ts";
 import { buildEvidence } from "./evidence.ts";
@@ -11,15 +9,14 @@ import { loadDecisionSettings, saveDecisionSettings } from "./settings.ts";
 import { configureDecision } from "./settings-ui.ts";
 import { showDecisionStatus } from "./status-ui.ts";
 import { ReviewHistory } from "./review-history.ts";
-import { reviewDisplay } from "./review-display.ts";
-import { feedbackWidget, feedbackPreview } from "./feedback-widget.ts";
+import { createSecretRedactor, type SecretRedactor } from "./secrets.ts";
 
 interface ReviewedTurn {
   evidence: TurnEvidence;
   report?: DecisionReport;
   turn: number;
-  settings?: DecisionSettings;
-  feedback?: string;
+  assistantEntryId: string;
+  settings: DecisionSettings;
   review?: Promise<void>;
   result?: ReviewResult;
 }
@@ -27,27 +24,39 @@ interface ReviewedTurn {
 function formatReport(report: DecisionReport, verbose = false): string {
   const rows = criterionIds.map(id => {
     const result = report.criteria[id];
-    return `| ${id} | ${result.choice} | ${(result.probabilities.pass * 100).toFixed(1)}% |`;
+    return `${id}: ${result.choice}; P(pass) ${(result.probabilities.pass * 100).toFixed(1)}%`;
   });
-  return [`### Decision feedback — turn ${report.turn}`, "| Criterion | Verdict | P(pass) |", "|---|---|---:|", ...rows,
+  return [`Decision feedback — turn ${report.turn}`, ...rows,
     report.flagged.length ? "Failed triage check. The escalation reviewer checks this turn automatically." : "All criteria passed the configured threshold.",
-    ...(verbose ? ["```json", JSON.stringify(report, null, 2), "```"] : []),
+    ...(verbose ? [JSON.stringify(report, null, 2)] : []),
     "Scores classify supplied evidence; they are not explanations or proof of correctness."].join("\n");
+}
+
+function feedbackComponent(text: string, theme: Theme): Container {
+  const [heading, ...lines] = text.split("\n");
+  const component = new Container();
+  component.addChild(new Text(theme.fg("customMessageLabel", theme.bold(heading)), 1, 0));
+  component.addChild(new Text(theme.fg("customMessageText", lines.join("\n")), 1, 0));
+  return component;
+}
+
+function formatReview(result: ReviewResult, turn: number): string {
+  if (!result.findings.length) return result.verdict === "accept"
+    ? `Decision reviewer — turn ${turn}\nThe advisor was requested but had no findings.`
+    : `Decision reviewer — turn ${turn}\nThe advisor was requested but could not determine whether a correction is needed.`;
+  return [`Decision reviewer — turn ${turn}`, ...result.findings.map(finding =>
+    `[${finding.severity.toUpperCase()}] ${finding.explanation}\nEvidence: ${finding.evidence}\nRecommendation: ${finding.recommendation}`),
+  ].join("\n\n");
 }
 
 export default function decisionAdvisor(pi: ExtensionAPI) {
   let controller = new AbortController();
-  let obfuscator: SecretObfuscator | undefined;
+  let redactor: SecretRedactor | undefined;
   let client: AzureDecisionClient | undefined;
   let configurationError: string | undefined;
   let configuration: DecisionSettings | undefined;
   let last: ReviewedTurn | undefined;
-  const pending = new Map<number, string>();
-  const reviewCards = new Map<number, ReviewResult>();
-  const scoring = new Set<Promise<void>>();
   const reviews = new Set<Promise<void>>();
-  const finalized = new Set<Promise<void>>();
-  const finishTurns: Array<() => void> = [];
   const reviewHistory = new ReviewHistory();
   let turn = 0;
 
@@ -55,12 +64,7 @@ export default function decisionAdvisor(pi: ExtensionAPI) {
     controller.abort();
     controller = new AbortController();
     last = undefined;
-    pending.clear();
-    reviewCards.clear();
-    scoring.clear();
     reviews.clear();
-    for (const finish of finishTurns.splice(0)) finish();
-    finalized.clear();
     reviewHistory.clear();
     turn = 0;
   };
@@ -69,79 +73,65 @@ export default function decisionAdvisor(pi: ExtensionAPI) {
     configuration = settings;
     client = undefined;
     configurationError = undefined;
-    try {
-      client = new AzureDecisionClient(toDecisionOptions(settings), { evidenceFits: state => countTokens(state, Encoding.Qwen3) <= 24_000 });
-    } catch { configurationError = "Decision scoring is not configured. Run /decision to choose the deployment."; }
+    try { client = new AzureDecisionClient(toDecisionOptions(settings)); }
+    catch { configurationError = "Decision scoring is not configured. Run /decision settings to choose the deployment."; }
   };
-  const showFailure = (captured: ReviewedTurn, text: string, ctx: ExtensionContext, record: object, severity: "info" | "warning" = "warning") => {
-    captured.feedback = text;
-    pending.set(captured.turn, text);
-    if (ctx.mode === "tui") {
-      const content = [...pending].sort(([a], [b]) => a - b).map(([, value]) => value).join("\n\n");
-      ctx.ui.setWidget("decision-feedback", feedbackWidget(ctx.ui, () => new Markdown(content, 0, 0, getMarkdownTheme())));
-    }
-    else if (ctx.mode === "json") console.log(JSON.stringify(record));
-    else if (ctx.mode === "print") console.log(text);
-    else ctx.ui.notify(text, severity);
+  const showError = (text: string, ctx: ExtensionContext, data: { turn: number; automatic: boolean }) => {
+    pi.appendEntry("decision-review-error", { ...data, text });
+    if (ctx.mode === "print") console.log(text);
   };
   const displayReview = (captured: ReviewedTurn, ctx: ExtensionContext, automatic: boolean) => {
-    const result = captured.result;
-    if (!result) return;
-    if (captured.settings?.verbose) {
-      const prefix = captured.report ? formatReport(captured.report, true) : "Decision scoring was not evaluated.";
-      const text = `${prefix}\n\n### Escalation review — turn ${captured.turn}\n\`\`\`json\n${JSON.stringify(result, null, 2)}\n\`\`\``;
-      if (ctx.mode === "print") { captured.feedback = text; pending.set(captured.turn, text); console.log(text); }
-      else showFailure(captured, text, ctx, { type: "decision_review", turn: captured.turn, automatic, review: result }, result.verdict === "accept" ? "info" : "warning");
-      return;
-    }
-    const display = reviewDisplay(result);
-    captured.feedback = display.text;
-    pending.set(captured.turn, display.text);
-    reviewCards.set(captured.turn, result);
-    if (ctx.mode === "tui") {
-      ctx.ui.setWidget("decision-feedback", feedbackWidget(ctx.ui, (_tui, theme) => display.component(theme)));
-    }
-    else if (ctx.mode === "print") console.log(display.text);
-    else if (ctx.mode === "json") console.log(JSON.stringify(result.verdict === "accept"
-      ? { type: "decision_review", turn: captured.turn, automatic, verdict: "accept", note: display.text }
-      : { type: "decision_review", turn: captured.turn, automatic, review: result }));
-    else ctx.ui.notify(display.text, result.verdict === "accept" ? "info" : "warning");
+    if (!captured.result) return;
+    const content = formatReview(captured.result, captured.turn);
+    pi.appendEntry("decision-review", { turn: captured.turn, assistantEntryId: captured.assistantEntryId, automatic, result: captured.result, content });
+    if (ctx.mode === "print") console.log(content);
   };
+
+  // Durable score/error entries never enter provider context and need no preview widget.
+  pi.registerEntryRenderer<DecisionReport & { verbose?: boolean }>("decision-report", (entry, _options, theme) => {
+    const report = entry.data;
+    return report && (report.flagged.length || report.verbose) ? feedbackComponent(formatReport(report, report.verbose), theme) : undefined;
+  });
+  pi.registerEntryRenderer<{ turn: number; reason: string }>("decision-error", (entry, _options, theme) => entry.data
+    ? feedbackComponent(`Decision feedback — turn ${entry.data.turn}\nStatus: not evaluated (${entry.data.reason}). No pass was recorded. The escalation reviewer checks this turn without a decision score.`, theme) : undefined);
+  pi.registerEntryRenderer<{ text: string }>("decision-review-error", (entry, _options, theme) => entry.data ? feedbackComponent(entry.data.text, theme) : undefined);
+  pi.registerEntryRenderer<{ turn: number; result: ReviewResult }>("decision-review", (entry, { expanded }, theme) => {
+    if (!entry.data) return undefined;
+    const { result, turn: reviewedTurn } = entry.data;
+    const component = new Container();
+    if (!result.findings.length) return feedbackComponent(formatReview(result, reviewedTurn), theme);
+    component.addChild(new Text(theme.fg("customMessageLabel", theme.bold(`Decision reviewer — turn ${reviewedTurn}`)), 1, 0));
+    for (const finding of expanded ? result.findings : result.findings.slice(0, 3)) {
+      const severity = theme.fg(finding.severity === "blocker" ? "error" : "warning", `[${finding.severity.toUpperCase()}]`);
+      component.addChild(new Text(`${severity} ${finding.explanation}\n${theme.fg("dim", `Evidence: ${finding.evidence}`)}\nRecommendation: ${finding.recommendation}`, 1, 1));
+    }
+    if (!expanded && result.findings.length > 3) component.addChild(new Text(theme.fg("dim", `${result.findings.length - 3} more findings — expand transcript details to view.`), 1, 0));
+    return component;
+  });
 
   const startReview = (captured: ReviewedTurn, ctx: ExtensionContext, automatic: boolean): Promise<void> => {
     if (captured.review) return captured.review;
     const generation = controller.signal;
     const job = (async () => {
+      const signal = AbortSignal.any([generation, AbortSignal.timeout(captured.settings.advisorTimeoutMs), ...(ctx.signal ? [ctx.signal] : [])]);
       try {
-        const settings = captured.settings;
-        if (!settings) throw new Error("Decision settings are unavailable.");
-        const signal = AbortSignal.any([generation, AbortSignal.timeout(settings.advisorTimeoutMs)]);
-        if (settings.verbose) {
-          const text = `${captured.feedback ?? ""}\n\nAdvisor requested for turn ${captured.turn}; waiting for findings.`.trim();
-          if (ctx.mode === "print") console.log(`Advisor requested for turn ${captured.turn}; waiting for findings.`);
-          else showFailure(captured, text, ctx, { type: "decision_review_requested", turn: captured.turn, automatic }, "info");
-        }
+        if (!redactor) throw new Error("Secret redaction is unavailable.");
         const result = await reviewTurn(ctx, captured.evidence, captured.report, signal, {
-          model: settings.reviewModel,
-          timeoutMs: settings.advisorTimeoutMs,
-          tools: settings.reviewTools,
-          instructions: settings.reviewInstructions,
-          history: reviewHistory.snapshot(captured.turn, settings.reviewHistoryTurns),
-        });
-        if (generation.aborted) return;
+          model: captured.settings.reviewModel,
+          timeoutMs: captured.settings.advisorTimeoutMs,
+          tools: captured.settings.reviewTools,
+          instructions: captured.settings.reviewInstructions,
+          history: reviewHistory.snapshot(captured.turn, captured.settings.reviewHistoryTurns),
+        }, redactor);
+        if (generation.aborted || ctx.signal?.aborted) return;
         captured.result = result;
-        reviewHistory.record({ turn: captured.turn, userRequest: captured.evidence.userRequest, result }, settings.reviewHistoryTurns);
-        pi.appendEntry("decision-review", { turn: captured.turn, automatic, ...result });
+        reviewHistory.record({ turn: captured.turn, userRequest: captured.evidence.userRequest, result }, captured.settings.reviewHistoryTurns);
         displayReview(captured, ctx, automatic);
-        if (result.findings.length) pi.sendMessage({ customType: "decision-advice", content: JSON.stringify({ turn: captured.turn, findings: result.findings }), display: false }, { deliverAs: "nextTurn", triggerTurn: false });
       } catch (error) {
-        if (generation.aborted) return;
-        const detail = error instanceof ReviewerConfigurationError ? error.message : "Check the reviewer model, its OMP credentials and review timeout in /decision settings.";
-        const text = `### Escalation review failed — turn ${captured.turn}\nNo reviewer findings were applied. ${detail}`;
-        pi.appendEntry("decision-review-error", { turn: captured.turn, automatic });
-        if (automatic) showFailure(captured, `${captured.feedback ?? ""}\n\n${text}`.trim(), ctx,
-          { type: "decision_review_error", turn: captured.turn, automatic });
-        else ctx.ui.notify(text, "error");
+        if (generation.aborted || ctx.signal?.aborted) return;
+        const detail = error instanceof ReviewerConfigurationError ? redactor?.redactText(error.message) ?? "Check reviewer configuration."
+          : "Check the reviewer model, its Pi credentials and review timeout in /decision settings.";
+        showError(`Escalation review failed — turn ${captured.turn}\nNo reviewer findings were applied. ${detail}`, ctx, { turn: captured.turn, automatic });
       }
     })();
     captured.review = job;
@@ -149,156 +139,133 @@ export default function decisionAdvisor(pi: ExtensionAPI) {
     void job.finally(() => reviews.delete(job)).catch(() => {});
     return job;
   };
+
   const initializeSettings = async (ctx: ExtensionContext) => {
-    if (ctx.agent.kind !== "main") return;
     reset();
     configuration = undefined;
     client = undefined;
+    redactor = undefined;
     configurationError = undefined;
+    const generation = controller.signal;
     let enabled = true;
     try {
-      obfuscator = await buildSecretObfuscator(ctx.cwd, getAgentDir());
-      const settings = await loadDecisionSettings(ctx.cwd);
+      const settings = await loadDecisionSettings(ctx.cwd, { projectTrusted: ctx.isProjectTrusted() });
       enabled = settings.enabled;
+      const nextRedactor = await createSecretRedactor(ctx);
+      if (generation.aborted) return;
+      redactor = nextRedactor;
       applySettings(settings);
-    } catch { configurationError = "Decision settings could not be loaded. Open /decision to configure them."; }
+    } catch { configurationError = "Decision settings or secret protection could not be loaded. Open /decision settings to configure them."; }
     if (configurationError && enabled) ctx.ui.notify(configurationError, "warning");
   };
-  pi.setLabel("Decision advisor");
   pi.on("session_start", (_event, ctx) => initializeSettings(ctx));
-  pi.on("session_switch", (_event, ctx) => initializeSettings(ctx));
-  pi.registerMessageRenderer<{ entries: Array<{ text: string; result?: ReviewResult }> }>("decision-feedback", (message, options, theme) => {
-    const component = new Container();
-    const entries = message.details?.entries ?? [{ text: String(message.content) }];
-    for (const [index, entry] of entries.entries()) {
-      if (index) component.addChild(new Text("", 0, 1));
-      component.addChild(entry.result ? reviewDisplay(entry.result).component(theme) : new Markdown(entry.text, 0, 0, getMarkdownTheme()));
-    }
-    return { render: width => feedbackPreview(component.render(width), width, theme, options.expanded), invalidate: () => component.invalidate() };
-  });
-  pi.on("before_agent_start", (_event, ctx) => {
-    if (ctx.agent.kind !== "main" || ctx.mode !== "tui" || !pending.size) return;
-    const entries = [...pending].sort(([a], [b]) => a - b).map(([turn, text]) => ({ text, result: reviewCards.get(turn) }));
-    return { message: { customType: "decision-feedback", content: entries.map(entry => entry.text).join("\n\n"), details: { entries }, display: true } };
-  });
-  pi.on("session_branch", reset);
   pi.on("session_tree", reset);
   pi.on("session_compact", reset);
   pi.on("session_shutdown", reset);
-  pi.on("context", event => ({ messages: event.messages.filter(message => !(message.role === "custom" && message.customType === "decision-feedback")) }));
-  pi.on("agent_start", (_event, ctx) => {
-    if (ctx.agent.kind !== "main") return;
-    pending.clear();
-    reviewCards.clear();
-    if (ctx.mode === "tui") ctx.ui.setWidget("decision-feedback", undefined);
+  // Keep the canonical transcript ending in the primary answer: Pi print mode relies on
+  // that. Project persisted review entries into requests only while their source turn
+  // remains in context; compaction/branch edits must not resurrect obsolete findings.
+  pi.on("context", (event, ctx) => {
+    const active = new Set(ctx.sessionManager.buildSessionProjection().entries.filter(entry => entry.messages.some(message => message.role === "assistant")).map(entry => entry.sourceEntry.id));
+    const advice = ctx.sessionManager.getBranch().flatMap(entry => {
+      if (entry.type !== "custom" || entry.customType !== "decision-review") return [];
+      const data: unknown = entry.data;
+      return data && typeof data === "object" && "assistantEntryId" in data && typeof data.assistantEntryId === "string"
+        && active.has(data.assistantEntryId) && "content" in data && typeof data.content === "string"
+        ? [{ role: "custom" as const, customType: "decision-review-context", content: data.content, display: false, timestamp: Date.parse(entry.timestamp) }]
+        : [];
+    });
+    const messages = [...event.messages];
+    const userIndex = messages.findLastIndex(message => message.role === "user");
+    messages.splice(userIndex < 0 ? messages.length : userIndex, 0, ...advice);
+    return { messages };
   });
-  pi.on("assistant_message", (_event, ctx) => {
-    if (ctx.agent.kind !== "main" || !configuration?.enabled) return;
-    // This hook is awaited before dispatch; turn_end observers may arrive after session_stop.
-    const ticket = new Promise<void>(resolve => finishTurns.push(resolve));
-    finalized.add(ticket);
-    void ticket.then(() => finalized.delete(ticket));
-  });
-  pi.on("session_stop", async (_event, ctx) => {
-    if (ctx.agent.kind === "main") await Promise.allSettled([...finalized, ...scoring]);
-  });
-  pi.on("session_stop", async (_event, ctx) => {
-    if (ctx.agent.kind === "main") await Promise.allSettled([...reviews]);
-  });
-  pi.on("turn_end", (event, ctx) => {
-    if (ctx.agent.kind !== "main" || !configuration?.enabled) return;
-    const finishTurn = finishTurns.shift();
-    const signal = controller.signal;
+  pi.on("agent_before_settle", async () => { await Promise.allSettled([...reviews]); });
+  pi.on("turn_end", async (event, ctx) => {
+    if (!configuration?.enabled || event.outcome === "aborted") return;
+    const generation = controller.signal;
+    const signal = AbortSignal.any([generation, ...(ctx.signal ? [ctx.signal] : [])]);
+    const settings = configuration;
+    const scoringClient = client;
     const currentTurn = ++turn;
-    const history = ctx.sessionManager.getBranch().flatMap(entry => entry.type === "message" ? [entry.message] : []);
-    const raw = buildEvidence(ctx.getSystemPrompt(), history, event.message, event.toolResults);
-    const job = (async () => {
-      obfuscator ??= await buildSecretObfuscator(ctx.cwd, getAgentDir());
-      const evidence = obfuscator ? obfuscator.obfuscateObject(raw) : raw;
-      const captured: ReviewedTurn = { evidence, turn: currentTurn, settings: configuration };
-      if (currentTurn === turn && !signal.aborted) last = captured;
-      let text: string;
-      let report: DecisionReport | undefined;
-      try {
-        if (!client) throw new Error(configurationError ?? "Decision client is not configured.");
-        const boundedSignal = AbortSignal.any([signal, AbortSignal.timeout(20_000)]);
-        report = await client.evaluate(evidence, currentTurn, boundedSignal);
-        if (signal.aborted) return;
-        captured.report = report;
-        if (currentTurn === turn) last = captured;
-        pi.appendEntry("decision-report", report);
-        if (!report.flagged.length) {
-          if (captured.settings?.verbose) {
-            const text = formatReport(report, true);
-            if (ctx.mode === "print") { captured.feedback = text; pending.set(currentTurn, text); console.log(text); }
-            else showFailure(captured, text, ctx, { type: "decision_feedback", turn: currentTurn, report, status: "evaluated" }, "info");
-          }
-          return;
-        }
-        text = formatReport(report, captured.settings?.verbose);
-      } catch (error) {
-        if (signal.aborted) return;
-        const reason = error instanceof DecisionError ? error.code : "configuration";
-        text = `### Decision feedback — turn ${currentTurn}\nStatus: **not evaluated** (${reason}). No pass was recorded. The escalation reviewer checks this turn without a decision score.`;
-        pi.appendEntry("decision-error", { turn: currentTurn, status: "not_evaluated" });
+    const history = ctx.sessionManager.buildSessionProjection().messages;
+    let captured: ReviewedTurn;
+    try {
+      redactor ??= await createSecretRedactor(ctx);
+      signal.throwIfAborted();
+      captured = { evidence: redactor.redactObject(buildEvidence([ctx.getSystemPrompt()], history, event.message, event.toolResults)), turn: currentTurn, assistantEntryId: event.messageEntryId, settings };
+    } catch {
+      if (signal.aborted) return;
+      pi.appendEntry("decision-error", { turn: currentTurn, reason: "redaction", status: "not_evaluated" });
+      if (ctx.mode === "print") console.log(`Decision feedback — turn ${currentTurn}\nStatus: not evaluated (redaction). No evidence was sent.`);
+      return;
+    }
+    last = captured;
+    try {
+      if (!scoringClient) throw new Error(configurationError ?? "Decision client is not configured.");
+      captured.report = await scoringClient.evaluate(captured.evidence, currentTurn, signal);
+      if (signal.aborted) return;
+      pi.appendEntry("decision-report", { ...captured.report, verbose: settings.verbose });
+      if (!captured.report.flagged.length) {
+        if (ctx.mode === "print" && settings.verbose) console.log(formatReport(captured.report, true));
+        return;
       }
-      showFailure(captured, text, ctx, { type: "decision_feedback", turn: currentTurn, report: report ?? null, status: report ? "evaluated" : "not_evaluated" });
-      void startReview(captured, ctx, true);
-    })();
-    scoring.add(job);
-    void job.finally(() => { scoring.delete(job); finishTurn?.(); }).catch(() => {});
-    return job;
+      if (ctx.mode === "print") console.log(formatReport(captured.report, settings.verbose));
+    } catch (error) {
+      if (signal.aborted) return;
+      const reason = error instanceof DecisionError ? error.code : "configuration";
+      pi.appendEntry("decision-error", { turn: currentTurn, reason, status: "not_evaluated" });
+      if (ctx.mode === "print") console.log(`Decision feedback — turn ${currentTurn}\nStatus: not evaluated (${reason}). No pass was recorded. The escalation reviewer checks this turn without a decision score.`);
+    }
+    void startReview(captured, ctx, true);
   });
+
   pi.registerCommand("decision", {
     description: "Decision controls: on, off, status, settings, review, or verbose [on|off]",
     handler: async (args, ctx) => {
-      let action = args.trim();
-      if (!action) {
-        if (ctx.mode !== "tui" && ctx.mode !== "rpc") { ctx.ui.notify("Use /decision on, off, status, settings, review or verbose [on|off].", "warning"); return; }
-        const choice = await ctx.ui.select(`Decision advisor — automatic review ${configuration?.enabled ? "on" : "off"}`, [
-          { label: "on", description: "Enable automatic turn scoring and failure review; save to this OMP profile." },
-          { label: "off", description: "Disable automatic scoring and escalation reviews; explicit status smoke remains available." },
-          { label: "status", description: "Show configuration and stored scores, and run one Decision-model smoke request." },
-          { label: "settings", description: "Choose deployment, escalation-reviewer model, tools, instructions, history and triage tuning." },
-        ]);
-        if (!choice) return;
-        action = choice;
+      try {
+        let action = args.trim();
+        const preferences = { projectTrusted: ctx.isProjectTrusted() };
+        if (!action) {
+          if (!ctx.hasUI) { console.log("Use /decision on, off, status, settings, review or verbose [on|off]."); return; }
+          const choice = await ctx.ui.select(`Decision advisor — automatic review ${configuration?.enabled ? "on" : "off"}`, ["on", "off", "status", "settings"]);
+          if (!choice) return;
+          action = choice;
+        }
+        if (["verbose", "verbose on", "verbose off", "on", "off"].includes(action)) {
+          const current = configuration ?? await loadDecisionSettings(ctx.cwd, preferences);
+          const changed = action.startsWith("verbose") ? "verbose" : "enabled";
+          const requested = changed === "enabled" ? action === "on" : action === "verbose" ? !current.verbose : action === "verbose on";
+          const saved = await saveDecisionSettings(ctx.cwd, { ...current, [changed]: requested }, preferences);
+          redactor ??= await createSecretRedactor(ctx);
+          applySettings(saved);
+          const text = `Decision ${changed === "enabled" ? "automatic review" : "verbose output"} is ${saved[changed] ? "on" : "off"}.${saved[changed] !== requested ? " A trusted project override takes precedence." : ""}`;
+          if (ctx.hasUI) ctx.ui.notify(text, saved[changed] !== requested ? "warning" : "info");
+          else console.log(ctx.mode === "json" ? JSON.stringify({ type: "decision_settings", [changed]: saved[changed] }) : text);
+          return;
+        }
+        if (action === "settings") {
+          const saved = await configureDecision(ctx);
+          if (saved) { redactor = await createSecretRedactor(ctx); applySettings(saved); }
+          return;
+        }
+        if (action === "status") {
+          await showDecisionStatus(ctx, configuration ?? await loadDecisionSettings(ctx.cwd, preferences), last, controller.signal);
+          return;
+        }
+        if (action !== "review") { ctx.ui.notify("Use /decision on, off, status, settings, review or verbose [on|off].", "warning"); return; }
+        if (!last) { ctx.ui.notify("No turn evidence captured in this session yet.", "warning"); return; }
+        const captured = last;
+        if (captured.review) {
+          await captured.review;
+          if (!captured.result) ctx.ui.notify("The escalation review did not complete. Inspect /decision settings.", "warning");
+          else if (ctx.hasUI) ctx.ui.notify(`Review for turn ${captured.turn} is already in the transcript.`, "info");
+          else console.log(formatReview(captured.result, captured.turn));
+        } else await startReview(captured, ctx, false);
+      } catch {
+        const text = "Decision command failed. Check /decision settings and preference file permissions. No configuration success was recorded.";
+        if (ctx.hasUI) ctx.ui.notify(text, "error"); else console.error(text);
       }
-      if (action === "verbose" || action === "verbose on" || action === "verbose off") {
-        const current = configuration ?? await loadDecisionSettings(ctx.cwd);
-        const verbose = action === "verbose" ? !current.verbose : action === "verbose on";
-        const saved = await saveDecisionSettings(ctx.cwd, { ...current, verbose });
-        applySettings(saved);
-        ctx.ui.notify(`Decision verbose output is ${saved.verbose ? "on" : "off"}.${saved.verbose !== verbose ? " A project override takes precedence." : ""}`, "info");
-        return;
-      }
-      if (action === "on" || action === "off") {
-        const current = configuration ?? await loadDecisionSettings(ctx.cwd);
-        const requested = action === "on";
-        const saved = await saveDecisionSettings(ctx.cwd, { ...current, enabled: requested });
-        applySettings(saved);
-        const message = `Automatic Decision review is ${saved.enabled ? "on" : "off"}.${saved.enabled !== requested ? " A project override takes precedence." : ""}${saved.enabled && configurationError ? " Choose a scoring model in /decision settings." : ""}`;
-        if (ctx.mode === "print" || ctx.mode === "json") console.log(JSON.stringify({ type: "decision_enabled", enabled: saved.enabled }));
-        else ctx.ui.notify(message, saved.enabled !== requested || (saved.enabled && configurationError) ? "warning" : "info");
-        return;
-      }
-      if (action === "settings") {
-        const saved = await configureDecision(ctx);
-        if (saved) applySettings(saved);
-        return;
-      }
-      if (action === "status") {
-        await showDecisionStatus(ctx, configuration ?? await loadDecisionSettings(ctx.cwd), last, controller.signal);
-        return;
-      }
-      if (action !== "review") { ctx.ui.notify("Use /decision on, off, status, settings or review.", "warning"); return; }
-      if (!last) { ctx.ui.notify("No turn evidence captured in this session yet.", "warning"); return; }
-      const captured = last;
-      if (captured.review) {
-        await captured.review;
-        if (captured.result) displayReview(captured, ctx, false);
-        else ctx.ui.notify("The escalation review did not complete. Inspect reviewer settings in /decision settings.", "warning");
-      } else await startReview(captured, ctx, false);
     },
   });
 }
