@@ -7,9 +7,9 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ModelRegistry, ModelRuntime, type ExtensionContext } from "@earendil-works/pi-coding-agent";
-import type { CredentialStore, ToolCall } from "@earendil-works/pi-ai";
+import { createAssistantMessageEventStream, type AssistantMessage, type CredentialStore, type ToolCall } from "@earendil-works/pi-ai";
 import { createReviewTools } from "../src/review-tools.ts";
-import { ReviewerConfigurationError, reviewTurn } from "../src/review.ts";
+import { ReviewerConfigurationError, ReviewerError, reviewTurn, waitForReviews } from "../src/review.ts";
 import { createSecretRedactor, SecretRedactor } from "../src/secrets.ts";
 import type { TurnEvidence } from "../src/types.ts";
 
@@ -138,11 +138,17 @@ test("empty grants expose no tools and invalid model or persisted OMP grants fai
       const signal = new AbortController().signal;
       const redactor = new SecretRedactor();
       for (const model of ["", "@advisor", "checker", "local-review/missing"]) {
-        await assert.rejects(reviewTurn(ctx, reviewerEvidence, undefined, signal, { ...reviewerOptions, model, tools: "" }, redactor), ReviewerConfigurationError);
+        await assert.rejects(reviewTurn(ctx, reviewerEvidence, undefined, signal, { ...reviewerOptions, model, tools: "" }, redactor), error => error instanceof ReviewerConfigurationError && error.code === "configuration");
       }
       for (const tools of ["glob", "recall", "lsp", "web_search", "eval", "ast_edit", "debug"]) {
         await assert.rejects(reviewTurn(ctx, reviewerEvidence, undefined, signal, { ...reviewerOptions, tools }, redactor), ReviewerConfigurationError);
       }
+      for (const timeoutMs of [99, 120_001, NaN, Infinity, 100.5]) {
+        await assert.rejects(reviewTurn(ctx, reviewerEvidence, undefined, signal, { ...reviewerOptions, timeoutMs, tools: "" }, redactor), error => error instanceof ReviewerConfigurationError && error.code === "configuration");
+      }
+      const cancelled = new AbortController();
+      cancelled.abort();
+      await assert.rejects(reviewTurn(ctx, reviewerEvidence, undefined, cancelled.signal, { ...reviewerOptions, tools: "" }, redactor), error => error instanceof ReviewerError && error.code === "cancelled");
       assert.equal(calls, 0);
       assert.equal((await reviewTurn(ctx, reviewerEvidence, undefined, signal, { ...reviewerOptions, tools: "" }, redactor)).verdict, "accept");
     });
@@ -200,7 +206,7 @@ test("denied reviewer tools cannot be converted to accept by a subsequent provid
     await localReviewer(cwd, (_request, response) => {
       completion(response, ++calls === 1 ? { name: "write", args: { path: "denied.txt", content: "bad" } } : accepted);
     }, async ctx => {
-      await assert.rejects(reviewTurn(ctx, reviewerEvidence, undefined, new AbortController().signal, { ...reviewerOptions, tools: "write" }, new SecretRedactor()), /tool operation failed or was denied/);
+      await assert.rejects(reviewTurn(ctx, reviewerEvidence, undefined, new AbortController().signal, { ...reviewerOptions, tools: "write" }, new SecretRedactor()), error => error instanceof ReviewerError && error.code === "tool");
       await assert.rejects(readFile(join(cwd, "denied.txt")), { code: "ENOENT" });
     });
     assert.equal(calls, 2);
@@ -236,7 +242,7 @@ test("timeout settles an unresolved dialog and rejects approval that arrives aft
     let approve!: (value: boolean) => void;
     await localReviewer(cwd, (_request, response) => completion(response, { name: "write", args: { path: "timeout.txt", content: "bad" } }), async base => {
       const ctx = context(cwd, base.modelRegistry, () => new Promise<boolean>(resolve => { approve = resolve; }));
-      await assert.rejects(reviewTurn(ctx, reviewerEvidence, undefined, new AbortController().signal, { ...reviewerOptions, timeoutMs: 100, tools: "write" }, new SecretRedactor()), /timed out/);
+      await assert.rejects(reviewTurn(ctx, reviewerEvidence, undefined, new AbortController().signal, { ...reviewerOptions, timeoutMs: 100, tools: "write" }, new SecretRedactor()), error => error instanceof ReviewerError && error.code === "timeout");
       assert.equal(typeof approve, "function");
       approve(true);
       await new Promise(resolve => setImmediate(resolve));
@@ -266,6 +272,90 @@ test("cancelled model streams cannot deliver a late tool call", async () => {
       await new Promise(resolve => setImmediate(resolve));
       assert.equal(confirmations, 0);
       await assert.rejects(readFile(join(cwd, "model-late.txt")), { code: "ENOENT" });
+    });
+  });
+});
+
+test("provider and invalid-response failures have sanitized typed categories", async () => {
+  await isolatedWorkspace(async cwd => {
+    for (const status of [401, 403, 429, 503]) {
+      await localReviewer(cwd, (_request, response) => {
+        response.writeHead(status, { "Content-Type": "application/json" });
+        response.end(JSON.stringify({ error: { message: `private-provider-body ${providerKey}`, type: "provider_failure" } }));
+      }, async ctx => {
+        await assert.rejects(reviewTurn(ctx, reviewerEvidence, undefined, new AbortController().signal, { ...reviewerOptions, tools: "" }, new SecretRedactor([providerKey])), error => {
+          assert.ok(error instanceof ReviewerError);
+          // Streamed provider prose does not expose a trustworthy HTTP status; never guess authentication.
+          assert.equal(error.code, "provider");
+          assert.doesNotMatch(error.message, /private-provider-body|local-provider-key/);
+          return true;
+        });
+      });
+    }
+    for (const text of ["not JSON", '{"verdict":"accept","findings":[{"severity":"concern"}]}', '{"verdict":"revise","findings":[]}']) {
+      await localReviewer(cwd, (_request, response) => completion(response, text), async ctx => {
+        await assert.rejects(reviewTurn(ctx, reviewerEvidence, undefined, new AbortController().signal, { ...reviewerOptions, tools: "" }, new SecretRedactor()), error => error instanceof ReviewerError && error.code === "response");
+      });
+    }
+  });
+});
+
+test("execution deadline settles a provider that ignores abort and never resolves result", async () => {
+  await isolatedWorkspace(async cwd => {
+    await localReviewer(cwd, () => { throw new Error("HTTP should not be reached"); }, async ctx => {
+      const source = createAssistantMessageEventStream();
+      let providerSignal: AbortSignal | undefined;
+      ctx.modelRegistry.registerProvider("local-review", {
+        api: "openai-completions", apiKey: providerKey, baseUrl: "https://example.invalid",
+        models: [{ id: "checker", name: "checker", input: ["text"], reasoning: false, contextWindow: 32_000, maxTokens: 2_000, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } }],
+        streamSimple: (_model, _context, options) => { providerSignal = options?.signal; return source; },
+      });
+      await assert.rejects(reviewTurn(ctx, reviewerEvidence, undefined, new AbortController().signal, { ...reviewerOptions, timeoutMs: 100, tools: "" }, new SecretRedactor()), error => error instanceof ReviewerError && error.code === "timeout");
+      assert.equal(providerSignal?.aborted, true);
+      // The provider still owns its unresolved stream; the reviewer has already settled independently.
+      source.end();
+    });
+  });
+});
+
+test("host wait expires without cancelling reviewer; explicit cancellation rejects late provider tools", async () => {
+  await isolatedWorkspace(async cwd => {
+    await localReviewer(cwd, () => { throw new Error("HTTP should not be reached"); }, async ctx => {
+      const sources: ReturnType<typeof createAssistantMessageEventStream>[] = [];
+      const signals: (AbortSignal | undefined)[] = [];
+      let { promise: waiting, resolve: entered } = Promise.withResolvers<void>();
+      ctx.modelRegistry.registerProvider("local-review", {
+        api: "openai-completions", apiKey: providerKey, baseUrl: "https://example.invalid",
+        models: [{ id: "checker", name: "checker", input: ["text"], reasoning: false, contextWindow: 32_000, maxTokens: 2_000, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } }],
+        streamSimple: (_model, _context, options) => {
+          const source = createAssistantMessageEventStream();
+          sources.push(source); signals.push(options?.signal); entered(); return source;
+        },
+      });
+      const generation = new AbortController();
+      let verdict: string | undefined;
+      const pending = reviewTurn(ctx, reviewerEvidence, undefined, generation.signal, { ...reviewerOptions, tools: "" }, new SecretRedactor()).then(result => { verdict = result.verdict; });
+      await waiting;
+      await waitForReviews([pending], generation.signal, 0);
+      assert.equal(verdict, undefined);
+      assert.equal(signals[0]?.aborted, false);
+      const model = ctx.modelRegistry.find("local-review", "checker")!;
+      const output: AssistantMessage = { role: "assistant", content: [{ type: "text", text: accepted }], api: model.api, provider: model.provider, model: model.id, timestamp: Date.now(), stopReason: "stop", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } };
+      sources[0]!.push({ type: "done", reason: "stop", message: output });
+      await pending;
+      assert.equal(verdict, "accept");
+      ({ promise: waiting, resolve: entered } = Promise.withResolvers<void>());
+      const cancelled = reviewTurn(ctx, reviewerEvidence, undefined, generation.signal, { ...reviewerOptions, tools: "write" }, new SecretRedactor());
+      const rejection = assert.rejects(cancelled, error => error instanceof ReviewerError && error.code === "cancelled");
+      await waiting;
+      generation.abort();
+      await rejection;
+      assert.equal(signals[1]?.aborted, true);
+      sources[1]!.push({ type: "done", reason: "toolUse", message: { ...output, stopReason: "toolUse", content: [{ type: "toolCall", id: "late-write", name: "write", arguments: { path: "after-cancel.txt", content: "bad" } }] } });
+      const tick = Promise.withResolvers<void>();
+      setImmediate(tick.resolve);
+      await tick.promise;
+      await assert.rejects(readFile(join(cwd, "after-cancel.txt")), { code: "ENOENT" });
     });
   });
 });

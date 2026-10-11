@@ -1,3 +1,4 @@
+import { isDeepStrictEqual } from "node:util";
 import type { TurnEvidence } from "./types.ts";
 
 /** Do not forward provider replay signatures or binary attachments to a text judge. */
@@ -22,12 +23,25 @@ export function buildEvidence(instructions: string[], history: unknown[], assist
     const item = message as Record<string, unknown>;
     return ["user", "assistant", "toolResult", "compactionSummary", "branchSummary"].includes(String(item.role));
   });
-  const user = relevant.findLast(message => message.role === "user");
+  const userIndex = relevant.findLastIndex(message => message.role === "user");
+  const currentAssistant = textEvidence(assistant);
+  const currentToolResults = toolResults.map(textEvidence);
+  const projectedHistory = relevant.map(textEvidence);
+  const excluded = new Set([userIndex]);
+  // Equal earlier replies are real context, not copies of this turn. Remove only
+  // the newest occurrence of each current message after the latest user request.
+  for (const current of [currentAssistant, ...currentToolResults]) {
+    for (let index = projectedHistory.length - 1; index > userIndex; index--) {
+      if (excluded.has(index) || !isDeepStrictEqual(projectedHistory[index], current)) continue;
+      excluded.add(index);
+      break;
+    }
+  }
   return {
     instructions,
-    userRequest: user ? JSON.stringify(textEvidence(user.content)) : "No user request available; abstain where necessary.",
-    recentHistory: relevant.slice(-8).map(textEvidence),
-    assistant: textEvidence(assistant),
-    toolResults: toolResults.map(textEvidence),
+    userRequest: userIndex >= 0 ? JSON.stringify(textEvidence(relevant[userIndex].content)) : "No user request available; abstain where necessary.",
+    recentHistory: projectedHistory.filter((_message, index) => !excluded.has(index)),
+    assistant: currentAssistant,
+    toolResults: currentToolResults,
   };
 }

@@ -1,18 +1,76 @@
 import { AzureCliCredential, DefaultAzureCredential } from "@azure/identity";
 import { validateDecisionOptions } from "./config.js";
 import { criterionIds, verdicts, type CriterionId, type CriterionResult, type DecisionOptions, type DecisionReport, type DecisionSmokeResult, type TurnEvidence, type Verdict } from "./types.js";
+import { countEvidenceTokens } from "./evidence-tokens.ts";
 
 export const COGNITIVE_SCOPE = "https://cognitiveservices.azure.com/.default";
-// Conservative application budget, NOT the model's tokenizer/context limit. Reserve space for the rubric.
-export const MAX_EVIDENCE_BYTES = 28_000;
+// Leave 4768 tokens for the rubric, choices and service framing within the 32768-token context.
+export const MAX_EVIDENCE_TOKENS = 28_000;
 const PROBABILITY_SUM_TOLERANCE = 0.01;
 
-export type DecisionErrorCode = "evidence" | "authentication" | "network" | "http" | "response" | "timeout" | "cancelled";
+export type DecisionErrorCode = "evidence" | "evidence_current_overflow" | "evidence_serialization" | "authentication" | "network" | "http" | "response" | "timeout" | "cancelled";
 export class DecisionError extends Error {
   constructor(readonly code: DecisionErrorCode, message: string) {
     super(message);
     this.name = "DecisionError";
   }
+}
+
+export class CurrentEvidenceOverflowError extends DecisionError {
+  readonly maxTokens = MAX_EVIDENCE_TOKENS;
+
+  constructor(readonly currentTokens: number) {
+    super("evidence_current_overflow", `Current-only evidence requires ${currentTokens} tokens, exceeding the ${MAX_EVIDENCE_TOKENS}-token budget; this turn remains unassessed. Current instructions, user request, assistant and tool results were preserved.`);
+    this.name = "CurrentEvidenceOverflowError";
+  }
+}
+
+export interface PackedEvidence {
+  evidence: TurnEvidence;
+  state: string;
+  tokens: number;
+  coreTokens: number;
+  removedHistoryMessages: number;
+}
+
+function serializeEvidence(evidence: TurnEvidence): string {
+  try {
+    const state = JSON.stringify(evidence);
+    if (typeof state === "string") return state;
+  } catch { /* Do not disclose evidence or serialization error details. */ }
+  throw new DecisionError("evidence_serialization", "Turn evidence must be JSON serializable; no evidence was sent.");
+}
+
+/** Keep current evidence intact; select newest complete history messages within the serialized budget. */
+export function packEvidence(evidence: TurnEvidence): PackedEvidence {
+  // Validate all evidence before dropping history: serialization failures must not become a score.
+  const originalState = serializeEvidence(evidence);
+  const core: TurnEvidence = { ...evidence, recentHistory: [] };
+  const coreState = evidence.recentHistory.length ? serializeEvidence(core) : originalState;
+  const coreTokens = countEvidenceTokens(coreState);
+  if (coreTokens > MAX_EVIDENCE_TOKENS) throw new CurrentEvidenceOverflowError(coreTokens);
+  // A large original state goes straight to packing, not approximate acceptance.
+  // Still serialize it above so invalid discarded history cannot produce a score.
+  const originalTokens = evidence.recentHistory.length
+    ? (originalState.length <= MAX_EVIDENCE_TOKENS * 4 ? countEvidenceTokens(originalState, MAX_EVIDENCE_TOKENS) : Infinity)
+    : coreTokens;
+  if (originalTokens <= MAX_EVIDENCE_TOKENS) {
+    return { evidence, state: originalState, tokens: originalTokens, coreTokens, removedHistoryMessages: 0 };
+  }
+  let packed = core;
+  let state = coreState;
+  let tokens = coreTokens;
+  for (let index = evidence.recentHistory.length - 1; index >= 0; index--) {
+    const candidate = { ...evidence, recentHistory: [evidence.recentHistory[index], ...packed.recentHistory] };
+    const candidateState = serializeEvidence(candidate);
+    const candidateTokens = countEvidenceTokens(candidateState, MAX_EVIDENCE_TOKENS);
+    if (candidateTokens > MAX_EVIDENCE_TOKENS) continue;
+    packed = candidate;
+    state = candidateState;
+    tokens = candidateTokens;
+  }
+  if (packed.recentHistory.length === evidence.recentHistory.length) packed = evidence;
+  return { evidence: packed, state, tokens, coreTokens, removedHistoryMessages: evidence.recentHistory.length - packed.recentHistory.length };
 }
 
 interface TokenProvider {
@@ -21,8 +79,6 @@ interface TokenProvider {
 export interface DecisionDependencies {
   credential?: TokenProvider;
   fetch?: typeof globalThis.fetch;
-  /** Host tokenizer may accept larger text within a conservative 24000-token evidence budget. */
-  evidenceFits?: (state: string) => boolean;
   /** Only literal loopback HTTP, and only with an injected credential. Never expose as an env setting. */
   allowTestLoopback?: boolean;
 }
@@ -120,7 +176,6 @@ export class AzureDecisionClient {
   private readonly options: DecisionOptions;
   private readonly credential: TokenProvider;
   private readonly fetch: typeof globalThis.fetch;
-  private readonly evidenceFits: (state: string) => boolean;
 
   constructor(options: DecisionOptions, dependencies: DecisionDependencies = {}) {
     this.options = validateDecisionOptions(options, dependencies.allowTestLoopback === true && dependencies.credential !== undefined);
@@ -128,20 +183,11 @@ export class AzureDecisionClient {
       ? new AzureCliCredential({ processTimeoutInMs: this.options.timeoutMs })
       : new DefaultAzureCredential({ processTimeoutInMs: this.options.timeoutMs }));
     this.fetch = dependencies.fetch ?? globalThis.fetch;
-    this.evidenceFits = dependencies.evidenceFits ?? (state => Buffer.byteLength(state, "utf8") <= MAX_EVIDENCE_BYTES);
   }
 
   async evaluate(evidence: TurnEvidence, turn: number, signal?: AbortSignal): Promise<DecisionReport> {
     if (!Number.isSafeInteger(turn) || turn < 1) throw new DecisionError("evidence", "Turn number must be a positive safe integer.");
-    let state: string;
-    try {
-      state = JSON.stringify(evidence);
-    } catch {
-      throw new DecisionError("evidence", "Turn evidence must be JSON serializable; no evidence was sent.");
-    }
-    if (typeof state !== "string" || !this.evidenceFits(state)) {
-      throw new DecisionError("evidence", "Serialized evidence exceeds the application context budget; this turn remains unassessed. Reduce retained history or tool volume without removing current evidence.");
-    }
+    const { state } = packEvidence(evidence);
     const criteria = await this.request(state, questions, parseAnswers, signal);
     return {
       turn,

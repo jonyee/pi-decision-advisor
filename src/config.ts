@@ -4,8 +4,11 @@ import type { DecisionOptions } from "./types.js";
 
 export const MIN_PASS_THRESHOLD = 0.5;
 export const MIN_TIMEOUT_MS = 100;
-export const MAX_TIMEOUT_MS = 120_000;
-export const MAX_HOST_TIMEOUT_MS = 20_000;
+export const MAX_CLIENT_TIMEOUT_MS = 120_000;
+export const MAX_SCORING_TIMEOUT_MS = 20_000;
+export const MAX_REVIEW_TIMEOUT_MS = 120_000;
+export const DEFAULT_REVIEW_TIMEOUT_MS = 60_000;
+export const REVIEW_HOST_WAIT_MS = 20_000;
 export const MAX_REVIEW_INSTRUCTIONS_BYTES = 8_192;
 export const MAX_REVIEW_HISTORY_TURNS = 8;
 
@@ -68,7 +71,7 @@ export function validateDecisionOptions(options: DecisionOptions, allowTestLoopb
   const endpoint = validateEndpoint(options.endpoint, allowTestLoopback);
   validateDeployment(options.deployment);
   validateThreshold(options.passThreshold);
-  validateTimeout(options.timeoutMs, MAX_TIMEOUT_MS, "Scoring timeout");
+  validateTimeout(options.timeoutMs, MAX_CLIENT_TIMEOUT_MS, "Scoring timeout");
   validateCredentialMode(options.credentialMode);
   return { endpoint, deployment: options.deployment, passThreshold: options.passThreshold, timeoutMs: options.timeoutMs, credentialMode: options.credentialMode };
 }
@@ -101,7 +104,7 @@ export function normalizeDecisionSettings(raw: Record<string, unknown>): Decisio
   const credentialMode = raw.credentialMode === undefined ? "azure-cli" : raw.credentialMode;
   const passThreshold = numberSetting(raw, "passThreshold", 0.8);
   const timeoutMs = numberSetting(raw, "timeoutMs", 10_000);
-  const advisorTimeoutMs = numberSetting(raw, "advisorTimeoutMs", 20_000);
+  const advisorTimeoutMs = numberSetting(raw, "advisorTimeoutMs", DEFAULT_REVIEW_TIMEOUT_MS);
   const reviewTools = parseReviewTools(stringSetting(raw, "reviewTools", "read,grep,find")).join(",");
   const reviewInstructions = raw.reviewInstructions === undefined ? "" : raw.reviewInstructions;
   if (typeof reviewInstructions !== "string") throw new Error("reviewInstructions must be a string.");
@@ -122,8 +125,8 @@ export function normalizeDecisionSettings(raw: Record<string, unknown>): Decisio
   }
   validateCredentialMode(credentialMode);
   validateThreshold(passThreshold);
-  validateTimeout(timeoutMs, MAX_HOST_TIMEOUT_MS, "Scoring timeout");
-  validateTimeout(advisorTimeoutMs, MAX_HOST_TIMEOUT_MS, "Automatic reviewer timeout");
+  validateTimeout(timeoutMs, MAX_SCORING_TIMEOUT_MS, "Scoring timeout");
+  validateTimeout(advisorTimeoutMs, MAX_REVIEW_TIMEOUT_MS, "Reviewer execution timeout");
   return { enabled, verbose, endpoint, deployment, reviewModel, credentialMode, passThreshold, timeoutMs, advisorTimeoutMs, reviewTools, reviewInstructions, reviewHistoryTurns };
 }
 

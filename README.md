@@ -21,7 +21,7 @@ pi install /path/to/omp-decision-advisor
 
 Restart Pi or reload extensions after installation. Remove with `pi remove <installed-source>`.
 
-Pi supplies the agent, model and TUI packages; they are peers, not bundled runtime copies. Azure Identity is the only external runtime dependency. The archive includes `src/`, the manifest and this README. TypeScript loads directly without an extension build. `private: true` prevents npm-registry publication; Git installation still works. The extension has no selected redistribution license.
+Pi supplies the agent, model and TUI packages; they are peers, not bundled runtime copies. External runtime dependencies are Azure Identity and `@huggingface/tokenizers`. The archive includes `src/`, the manifest and this README, including the pinned compressed Qwen3.5 tokenizer and its Apache-2.0 license. Tokenization is offline; no model weights or runtime tokenizer downloads are required. TypeScript loads directly without an extension build. `private: true` prevents npm-registry publication; Git installation still works. The extension itself has no selected redistribution license.
 
 For a tarball, first install it with npm into a private directory, then `pi install` that package directory:
 
@@ -48,7 +48,7 @@ Run `/decision` for **on**, **off**, **status**, and **settings**. Select both a
 | Azure credentials | Azure CLI identity (`az login`) or `DefaultAzureCredential` |
 | Pass threshold | Initially 0.8; range 0.5–1; lower means fewer escalations |
 | Scoring timeout | Initially 10000 ms; range 100–20000 ms, covering authentication and inference |
-| Reviewer timeout | Initially 20000 ms; range 100–20000 ms, including tool approvals |
+| Reviewer timeout | Initially 60000 ms; range 100–120000 ms, including tool approvals; independent of the host's bounded wait |
 | Verbose output | Off by default; shows passing scores and full sanitized Decision reports, not reviewer JSON |
 
 **Save** persists validated user preferences and applies effective values immediately. **Cancel** discards the draft. Settings changes clear latest-turn capture and in-memory review history and cancel old-configuration work.
@@ -104,7 +104,7 @@ Authorization: Bearer <Azure Identity token>
 
 This is direct classification, not a chat-completions provider. A turn fails triage if any verdict is `concern`, `blocker` or `cannot_tell`, or `P(pass)` is below the configured threshold. Equality passes. The starting 0.8 threshold is not a calibrated correctness guarantee. Scoring failures remain **not evaluated**, and invoke review without a score; reviewer failures never become accepts. If secret protection fails, no raw evidence is sent.
 
-Scoring is awaited in Pi's `turn_end`. Reviewer work can overlap later primary tool-loop turns; `agent_before_settle` waits for outstanding reviews. Generation and abort signals prevent cancelled work from publishing late results. The extension never sets `continue: true`, steers the primary, changes its model, approves primary actions or invokes a native watchdog.
+Scoring is awaited in Pi's `turn_end`. Reviewer work can overlap later primary tool-loop turns. At `agent_before_settle`, the extension waits at most 20000 ms for outstanding reviews; exhausting this wait does not cancel their execution. A reviewer has its own execution deadline, initially 60000 ms and configurable up to 120000 ms. Existing saved shorter reviewer timeouts remain unchanged. A late completed review is persisted for the next natural request without restarting the primary. Settings changes, off, session changes and shutdown cancel extension-owned work. Aborted primary turns also cancel their reviews. Stock Pi 0.99.2 exposes no public cancellation event for Escape after the primary loop has already stopped during pre-settlement; that action cannot reliably cancel a detached reviewer. The extension never sets `continue: true`, steers the primary, changes its model, approves primary actions or invokes a native watchdog.
 
 Reviews may accept first-stage flags that investigation does not confirm. Tool-enabled reviews can make multiple chat-model requests; passing turns make no reviewer requests. The owner reports an endpoint allowance of 17 requests/second. The extension does not change quota, deployment capacity or rate limits.
 
@@ -118,7 +118,9 @@ Scores/errors never enter model context. Persisted reviews are projected as advi
 
 In **text print mode**, the primary answer remains on stdout; Pi routes extension score/review/status diagnostics to stderr. In **JSON mode**, standard `entry_appended` events retain full structured Decision reports and review results regardless of verbose presentation. No private Pi stdout APIs or patched native advisor events are used.
 
-Evidence includes the current standing prompt, latest user request, up to eight recent projected messages, current assistant output and tool results. Attachments are explicitly unavailable to the text-only judge. Without OMP's native tokenizer, the extension and standalone probe share the client's conservative **28000 serialized UTF-8 byte** evidence budget, reserving room for rubrics within Decision-1's published 32768-token context. This is an application allowance, not a model-token count. Oversized evidence is rejected, never silently truncated. Review is post-turn and cannot prevent a tool action already executed.
+Evidence includes the current standing prompt, latest user request, current assistant output and tool results. Those current fields remain intact. The latest user message and current assistant/tool-result copies are excluded from historical context; older context is packed newest-first into complete messages within a **28000-token** serialized-evidence allowance, then presented chronologically. Token counting uses the bundled offline Qwen3.5-9B tokenizer, leaving 4768 tokens within Decision-1's published 32768-token context for rubric, choices and service framing. The service's internal formatting is not exposed, so near-ceiling Azure acceptance is not guaranteed. If current evidence alone exceeds the allowance, the extension reports that separately with token counts and sends no scoring request; the original current evidence remains available for independent review. Evidence is never silently truncated. Attachments are explicitly unavailable to the text-only judge. Review is post-turn and cannot prevent a tool action already executed.
+
+Reviewer failures expose sanitized categories: `timeout`, `cancelled`, `configuration`, `provider`, `tool`, or `response`. A timeout reports the reviewer deadline rather than suggesting credentials. Provider errors do not print upstream bodies, tokens or private endpoint details; configuration and response failures never become accepted reviews.
 
 ## Checkout utilities and deployment
 
@@ -158,7 +160,11 @@ npm run probe
 
 Stock Pi 0.99.2 CLI smokes used a local TLS System One fixture with the real Azure Identity CLI path and deterministic chat providers. They exercised batched tool-loop scoring, selected-tool file reads, evidence/tool-result redaction, scores-before-notes, findings in the next natural prompt, silent passing output, accepted-review print output, headless mutation denial and status smoke while off. Two prompts with a primary file-read loop produced three primary calls, with no feedback-triggered calls.
 
-Actual Pi TUI verification covered the four-action menu, preference cancellation, retained scores, three-finding collapse, Ctrl+O expansion, status smoke, focused loading cancellation, blocked main-editor input during loading and persisted off state. Actual RPC verification covered approved mutation, denial, review timeout, abort and late approval fencing. TypeScript checking and all 136 behavioral tests pass. These are local deterministic checks, **not live Azure inference or reviewer-quality calibration**.
+Actual Pi TUI verification covered the four-action menu, preference cancellation, retained scores, three-finding collapse, Ctrl+O expansion, status smoke, focused loading cancellation, blocked main-editor input during loading and persisted off state. Actual RPC verification covered approved mutation, denial, review timeout, abort and late approval fencing. TypeScript checking and all 159 behavioral tests pass. These are local deterministic checks, **not live Azure inference or reviewer-quality calibration**.
+
+Correction smokes exercised actual Pi 0.99.2 sessions: a 21.5-second reviewer outlived the default 20-second settlement wait, persisted its finding afterward, and supplied it to the next natural request without an extra primary call. A stalled reviewer produced the durable `timeout` category; current-only overflow produced `evidence_current_overflow` with zero scoring calls. Actual TUI output retained score lines before the timeout notice and showed execution-deadline guidance instead of generic credential advice. These checks used synthetic providers and made no live Azure inference requests.
+
+Replaying the supplied 36-turn export through deduplication and historical packing admitted 35 turns without changing current evidence; one current-only payload still exceeded the allowance. No scoring requests were made. Token-counter comparisons covered Unicode/NFC, JSON, special tokens and cached/capped counting against the full pinned tokenizer.
 
 ## Changes
 
@@ -168,6 +174,8 @@ Actual Pi TUI verification covered the four-action menu, preference cancellation
 - Extension-owned private preferences with trusted read-only project overrides and explicit reviewer model IDs.
 - Isolated selected-tool reviewer, per-operation elevated approval, fail-closed headless execution and one-way secret redaction.
 - Pi launcher/probe configuration and behavioral regression coverage for host integration, cancellation, approvals and persistence.
+- Offline 28000-token evidence allowance with current-turn deduplication, newest-first historical packing and explicit current-only overflow reporting.
+- Independent reviewer execution deadline (60000 ms default, up to 120000 ms), bounded 20000 ms settlement wait and sanitized failure categories.
 
 ## Sources
 

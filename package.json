@@ -5,10 +5,22 @@
   "type": "module",
   "description": "Azure Decision-1 turn triage with an isolated configurable Pi escalation reviewer",
   "license": "UNLICENSED",
-  "keywords": ["pi-package", "azure", "advisor"],
-  "files": ["src/"],
-  "engines": { "node": ">=22.19.0" },
-  "pi": { "extensions": ["src/index.ts"] },
+  "keywords": [
+    "pi-package",
+    "azure",
+    "advisor"
+  ],
+  "files": [
+    "src/"
+  ],
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "pi": {
+    "extensions": [
+      "src/index.ts"
+    ]
+  },
   "scripts": {
     "check": "tsc --noEmit",
     "test": "tsx --test test/*.test.ts",
@@ -16,16 +28,19 @@
     "probe": "tsx scripts/probe.ts",
     "pi": "tsx scripts/pi.ts"
   },
-  "dependencies": { "@azure/identity": "4.13.0" },
+  "dependencies": {
+    "@azure/identity": "4.13.0",
+    "@huggingface/tokenizers": "0.2.0"
+  },
   "peerDependencies": {
-    "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-agent-core": "*",
+    "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*",
     "@earendil-works/pi-tui": "*"
   },
   "devDependencies": {
-    "@earendil-works/pi-ai": "0.99.2",
     "@earendil-works/pi-agent-core": "0.99.2",
+    "@earendil-works/pi-ai": "0.99.2",
     "@earendil-works/pi-coding-agent": "0.99.2",
     "@earendil-works/pi-tui": "0.99.2",
     "@types/node": "22.19.15",

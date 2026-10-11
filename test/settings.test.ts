@@ -6,7 +6,7 @@ import { join } from "node:path";
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { discoverDecisionDeployments } from "../src/azure-models.js";
 import type { AzureRunner } from "../src/azure-cli.js";
-import { MAX_REVIEW_INSTRUCTIONS_BYTES, normalizeDecisionSettings, toDecisionOptions, type DecisionSettings } from "../src/config.js";
+import { DEFAULT_REVIEW_TIMEOUT_MS, MAX_REVIEW_INSTRUCTIONS_BYTES, REVIEW_HOST_WAIT_MS, normalizeDecisionSettings, toDecisionOptions, type DecisionSettings } from "../src/config.js";
 import { ELEVATED_REVIEW_TOOLS, parseReviewTools } from "../src/review-tools.js";
 import { loadDecisionSettings, saveDecisionSettings } from "../src/settings.js";
 import { configureDecision } from "../src/settings-ui.js";
@@ -89,16 +89,33 @@ test("stored host deadlines and pass probability have bounded numeric semantics"
   for (const passThreshold of [NaN, Infinity, -Infinity, 0.49, 1.01, "0.8", null]) {
     assert.throws(() => normalizeDecisionSettings({ ...configured, passThreshold }));
   }
-  for (const key of ["timeoutMs", "advisorTimeoutMs"] as const) {
-    for (const value of [100, 20_000]) {
+  for (const [key, maximum] of [["timeoutMs", 20_000], ["advisorTimeoutMs", 120_000]] as const) {
+    for (const value of [100, maximum]) {
       const settings = normalizeDecisionSettings({ ...configured, [key]: value });
       assert.equal(settings[key], value);
     }
-    for (const value of [99, 20_001, 100.5, Infinity, NaN, "1000", null]) {
+    for (const value of [99, maximum + 1, 100.5, Infinity, NaN, "1000", null]) {
       assert.throws(() => normalizeDecisionSettings({ ...configured, [key]: value }));
     }
   }
+  assert.equal(normalizeDecisionSettings({}).advisorTimeoutMs, DEFAULT_REVIEW_TIMEOUT_MS);
+  assert.equal(normalizeDecisionSettings({ advisorTimeoutMs: 1_250 }).advisorTimeoutMs, 1_250);
   assert.throws(() => toDecisionOptions({ ...configured, timeoutMs: 20_001 }));
+});
+
+test("reviewer execution deadlines above the host wait survive saved preference tuning", async () => {
+  const root = await mkdtemp(join(tmpdir(), "decision-review-deadlines-"));
+  try {
+    for (const advisorTimeoutMs of [45_000, 60_000, 120_000]) {
+      const saved = await saveDecisionSettings(root, { ...configured, advisorTimeoutMs }, { agentDir: root });
+      assert.equal(saved.advisorTimeoutMs, advisorTimeoutMs);
+      const loaded = await loadDecisionSettings(root, { agentDir: root });
+      const tuned = await saveDecisionSettings(root, { ...loaded, passThreshold: 0.95 }, { agentDir: root });
+      assert.equal(tuned.advisorTimeoutMs, advisorTimeoutMs);
+      assert.equal(JSON.parse(await readFile(join(root, "decision-advisor.json"), "utf8")).advisorTimeoutMs, advisorTimeoutMs);
+      assert.equal(toDecisionOptions(tuned).timeoutMs, configured.timeoutMs);
+    }
+  } finally { await rm(root, { recursive: true, force: true }); }
 });
 
 test("stored provider endpoints reject credentials and non-origin URLs even before deployment selection", () => {
@@ -364,6 +381,7 @@ test("settings dialogs cancel drafts and require confirmation before persisting 
       },
       confirm: async () => { assert.ok(confirmations.length); return confirmations.shift()!; },
       editor: async (_title: string, prefill: string) => { assert.equal(prefill, ""); return instructions; },
+      input: async (_title: string, prefill: string) => { assert.equal(prefill, String(DEFAULT_REVIEW_TIMEOUT_MS)); return "45000"; },
       notify: (message: string, type: string) => { if (type === "warning") warnings.push(message); },
     },
   } as unknown as ExtensionCommandContext;
@@ -375,11 +393,12 @@ test("settings dialogs cancel drafts and require confirmation before persisting 
     confirmations.push(false, false);
     assert.equal(await configureDecision(ctx), undefined);
     assert.deepEqual(await readdir(root), []);
-    selections.push("Reviewer model", "provider/selected-reviewer", "Instructions", "Tools", "[off] bash", "Done", "Save");
+    selections.push("Reviewer model", "provider/selected-reviewer", "Reviewer execution timeout", "Instructions", "Tools", "[off] bash", "Done", "Save");
     confirmations.push(true, true);
     const saved = await configureDecision(ctx);
     assert.equal(saved?.reviewModel, "provider/selected-reviewer");
     assert.equal(saved?.reviewInstructions, instructions);
+    assert.equal(saved?.advisorTimeoutMs, 45_000);
     assert.equal(parseReviewTools(saved!.reviewTools).includes("bash"), true);
     assert.deepEqual(await loadDecisionSettings(root, { agentDir: root }), saved);
     selections.push("Reviewer model", "Leave reviewer unconfigured", "Save");
@@ -488,5 +507,8 @@ test("unconfigured status is readable in print mode and structured in JSON mode 
     assert.equal(record.type, "decision_status");
     assert.equal(record.smoke.state, "not_configured");
     assert.equal(record.reviewer, "");
+    assert.equal(record.reviewerTimeoutMs, DEFAULT_REVIEW_TIMEOUT_MS);
+    assert.equal(record.reviewHostWaitMs, REVIEW_HOST_WAIT_MS);
+    assert.equal(record.scoringTimeoutMs, settings.timeoutMs);
   } finally { console.log = previousLog; }
 });

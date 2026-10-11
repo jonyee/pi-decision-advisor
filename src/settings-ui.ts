@@ -1,6 +1,6 @@
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { discoverDecisionDeployments } from "./azure-models.ts";
-import { normalizeDecisionSettings, toDecisionOptions, type DecisionSettings } from "./config.ts";
+import { MAX_REVIEW_TIMEOUT_MS, MAX_SCORING_TIMEOUT_MS, MIN_TIMEOUT_MS, REVIEW_HOST_WAIT_MS, normalizeDecisionSettings, toDecisionOptions, type DecisionSettings } from "./config.ts";
 import { loadDecisionSettings, saveDecisionSettings } from "./settings.ts";
 import { withLoading } from "./loading-ui.ts";
 import { ELEVATED_REVIEW_TOOLS, parseReviewTools, REVIEW_TOOL_OPTIONS } from "./review-tools.ts";
@@ -100,8 +100,8 @@ export async function configureDecision(ctx: ExtensionCommandContext): Promise<D
       { label: "Review history entries", description: `${draft.reviewHistoryTurns} (0–8) · completed prior summaries in this session only.` },
       { label: "Azure credentials", description: draft.credentialMode === "azure-cli" ? "Azure CLI identity (az login)" : "DefaultAzureCredential" },
       { label: "Pass threshold", description: `${draft.passThreshold} · lower means fewer reviews; higher is stricter (0.5–1).` },
-      { label: "Scoring timeout", description: `${draft.timeoutMs} ms (100–20000).` },
-      { label: "Automatic reviewer timeout", description: `${draft.advisorTimeoutMs} ms (100–20000).` },
+      { label: "Scoring timeout", description: `${draft.timeoutMs} ms (${MIN_TIMEOUT_MS}–${MAX_SCORING_TIMEOUT_MS}).` },
+      { label: "Reviewer execution timeout", description: `${draft.advisorTimeoutMs} ms (${MIN_TIMEOUT_MS}–${MAX_REVIEW_TIMEOUT_MS}); host waits at most ${REVIEW_HOST_WAIT_MS} ms, then findings arrive asynchronously.` },
       { label: "Verbose output", description: draft.verbose ? "On: all Decision scores and full Decision JSON; reviewer notes stay concise." : "Off: silent passes, compact failed scores and concise reviewer notes." },
       { label: "Save", description: "Persist validated user preferences; Azure credentials are never saved." },
       { label: "Cancel", description: "Discard this draft without changing preferences." },
@@ -134,9 +134,10 @@ export async function configureDecision(ctx: ExtensionCommandContext): Promise<D
           { label: "DefaultAzureCredential", description: "Use Azure SDK credential discovery, such as managed identity or development credentials." },
         ]);
         if (mode !== undefined) draft = { ...draft, credentialMode: mode === "Azure CLI identity" ? "azure-cli" : "default" };
-      } else if (choice === "Pass threshold" || choice === "Scoring timeout" || choice === "Automatic reviewer timeout") {
+      } else if (choice === "Pass threshold" || choice === "Scoring timeout" || choice === "Reviewer execution timeout") {
         const key = choice === "Pass threshold" ? "passThreshold" : choice === "Scoring timeout" ? "timeoutMs" : "advisorTimeoutMs";
-        const title = choice === "Pass threshold" ? "Pass threshold (0.5–1; lower means fewer reviews, higher is stricter)" : `${choice} in milliseconds (100–20000)`;
+        const maximum = key === "advisorTimeoutMs" ? MAX_REVIEW_TIMEOUT_MS : MAX_SCORING_TIMEOUT_MS;
+        const title = choice === "Pass threshold" ? "Pass threshold (0.5–1; lower means fewer reviews, higher is stricter)" : `${choice} in milliseconds (${MIN_TIMEOUT_MS}–${maximum})`;
         const value = await ctx.ui.input(title, String(draft[key]));
         if (value !== undefined) {
           if (!/^(?:\d+(?:\.\d+)?|\.\d+)$/.test(value.trim())) throw new Error("Enter a decimal number without units.");
