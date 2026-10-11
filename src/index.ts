@@ -50,11 +50,20 @@ export default function decisionAdvisor(pi: ExtensionAPI, options: { reviewWaitM
   const reviewHistory = new ReviewHistory();
   let turn = 0;
   let primaryCancellation: (() => void) | undefined;
+  let reviewStatusUI: ExtensionContext["ui"] | undefined;
 
+  // A dedicated footer status survives agent_end and the bounded settlement wait.
+  // Do not borrow the primary loader: it is streaming-only and shared with other work.
+  const updateReviewStatus = (ctx?: ExtensionContext) => {
+    if (ctx?.mode === "tui") reviewStatusUI = ctx.ui;
+    reviewStatusUI?.setStatus("decision-review-activity", reviews.size === 0 ? undefined
+      : reviews.size === 1 ? "Reviewing…" : `Reviewing… (${reviews.size} pending)`);
+  };
   const cancelReviews = () => {
     reviewerController.abort();
     reviewerController = new AbortController();
     reviews.clear();
+    updateReviewStatus();
   };
   const watchPrimaryCancellation = (signal: AbortSignal | undefined) => {
     primaryCancellation?.();
@@ -68,6 +77,7 @@ export default function decisionAdvisor(pi: ExtensionAPI, options: { reviewWaitM
     primaryCancellation?.();
     primaryCancellation = undefined;
     cancelReviews();
+    reviewStatusUI = undefined;
     controller.abort();
     controller = new AbortController();
     last = undefined;
@@ -145,7 +155,11 @@ export default function decisionAdvisor(pi: ExtensionAPI, options: { reviewWaitM
     })();
     captured.review = job;
     reviews.add(job);
-    void job.finally(() => reviews.delete(job)).catch(() => {});
+    updateReviewStatus(ctx);
+    void job.finally(() => {
+      // Cancelled/reset generations must not clear a newer review's status.
+      if (reviews.delete(job)) updateReviewStatus();
+    }).catch(() => {});
     return job;
   };
 

@@ -112,6 +112,8 @@ History contains only completed earlier-turn summaries, sorted by primary turn, 
 
 ## Transcript and output
 
+While one or more advisor reviews are running, the TUI footer shows **`Reviewing…`**, or **`Reviewing… (N pending)`** for overlapping reviews. This is a separate extension status: it does not override the primary assistant's Working indicator or take editor focus. It stays visible after the primary stops and after the bounded settlement wait expires, until every pending review completes or fails. Cancellation, settings/session resets and shutdown clear it immediately; a cancelled review's late completion cannot erase a newer review's status. Manual review uses the same indicator and reusing an existing review does not add another pending job. The status is ephemeral, is not saved or sent to models, and produces no print/JSON/RPC output.
+
 Scores, scoring errors and review results are durable **Pi custom session entries** with extension-owned renderers. All automatic scores and scoring errors render nothing, even with a saved verbose preference or expanded transcript. Automatic scoring configuration warnings are also suppressed. Use `/decision status` for explicit scoring diagnostics; advisor feedback remains visible. Findings carry severity, evidence and recommendation. Collapsed reviews show three findings; **Ctrl+O** expands the remainder. Empty accepted/uncertain reviews display explicit notices.
 
 Advisor TUI colors use the active theme's semantic tokens (normally green/yellow/red), not the generic custom-message label color:
