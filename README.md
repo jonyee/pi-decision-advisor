@@ -112,7 +112,41 @@ History contains only completed earlier-turn summaries, sorted by primary turn, 
 
 ## Transcript and output
 
+While one or more advisor reviews are running, the TUI footer shows **`Reviewing…`**, or **`Reviewing… (N pending)`** for overlapping reviews. During the automatic post-run settlement wait, the extension also re-shows Pi's native **Working** indicator, retaining its configured message and animation. It clears the review-owned indicator when Pi settles, or relinquishes it without hiding it when a queued primary continuation starts. Reset/shutdown hides a review-owned indicator immediately. This changes only presentation—not the bounded wait, reviewer lifetime or primary scheduling—and never takes editor focus.
+
+The footer stays visible after the primary stops and after the bounded settlement wait expires, until every pending review completes or fails. Pi's public Working API cannot create its loader once the session is settled, so detached reviews and idle manual reviews use the footer only. Cancellation, settings/session resets and shutdown clear the footer immediately; a cancelled review's late completion cannot erase a newer review's status. Manual review uses the same footer indicator and reusing an existing review does not add another pending job. Activity indicators are ephemeral, are not saved or sent to models, and produce no print/JSON/RPC output.
+
 Scores, scoring errors and review results are durable **Pi custom session entries** with extension-owned renderers. All automatic scores and scoring errors render nothing, even with a saved verbose preference or expanded transcript. Automatic scoring configuration warnings are also suppressed. Use `/decision status` for explicit scoring diagnostics; advisor feedback remains visible. Findings carry severity, evidence and recommendation. Collapsed reviews show three findings; **Ctrl+O** expands the remainder. Empty accepted/uncertain reviews display explicit notices.
+
+Advisor TUI colors use the active theme's semantic tokens (normally green/yellow/red), not the generic custom-message label color:
+
+| Review outcome | Color | Meaning |
+|---|---|---|
+| `accept` (no findings) | `success` / green | The reviewer found no issue to report; this does not prove Decision scoring passed or correctness |
+| `revise` with concerns only | `warning` / yellow | At least one material issue needs correction |
+| Any review containing a blocker | `error` / red | A serious issue was reported; the heading stays red even if the blocker is collapsed |
+| `cannot_tell` without blockers | `warning` / yellow | The reviewer could not reach a reliable conclusion; it may still report concerns |
+| Review failure | `error` / red | Review execution/configuration/response failed; no reviewer findings were applied |
+
+Individual finding labels and explanations use their severity color; evidence and recommendations remain neutral. These colors affect TUI rendering only, including stored entries after reload. Color styling does not alter print text, structured results or advisory model context. Cancelled extension-owned work is normally suppressed rather than displayed as a review failure.
+
+### Addressing individual findings
+
+The reviewer supplies structured findings; the extension assigns each validated finding a compact reference of the form **`<severity>-<turn><two-digit-finding-number>`**. `C` means concern and `B` means blocker (the only finding severities), for example:
+
+```text
+Advisor review (2)
+
+C-201 [CONCERN] The implementation ignores an empty input.
+Evidence: src/parser.ts:42
+Recommendation: Handle an empty input explicitly.
+```
+
+Use a natural follow-up such as **"Fix C-201, and explain whether B-202 is still relevant."** Findings are numbered in their returned order across severities: `C-201` is turn 2/finding 01, `B-202` is turn 2/finding 02. Single-digit turns have four ID characters plus the hyphen; multi-digit turns keep their full number (`C-1301` for turn 13/finding 01). Ordinals over 99 use an extra separator (`C-2-100`) to avoid ambiguity rather than wrapping.
+
+The same IDs appear in TUI and print output, persisted review JSON (`findings[].id`), advisory primary-model context and bounded previous-review summaries. IDs stay stable on expansion, saved-result reload and `/decision review` reuse. They are local references, **not globally unique**: settings changes, on/off, branching, compaction and session/reload resets can restart the turn counter and reuse short IDs. They identify finding occurrences, not a globally deduplicated issue; later reviews of the same defect receive references for their own turns. Existing saved IDs (including the former long format) are preserved; unnumbered reviews remain readable and are not rewritten. Empty reviews have no findings to number. References do not implement an automatic fix or resolution-tracking command.
+
+You can influence investigation and wording through **`/decision settings` → Instructions**. The extension owns the JSON contract, validation, IDs and rendered notices (including "had no findings"); the model is not asked to maintain a numbering counter.
 
 Scores/errors never enter model context. Persisted reviews are projected as advisory custom context on later natural requests only while their source assistant entry remains in the current projected context. Branching, compaction or context edits do not resurrect omitted source turns. The canonical primary transcript still ends in its answer, preserving stock Pi's print behavior.
 

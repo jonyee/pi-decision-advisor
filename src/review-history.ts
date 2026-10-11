@@ -34,6 +34,7 @@ function copyEntry(entry: ReviewHistoryEntry): ReviewHistoryEntry {
       model: entry.result.model,
       verdict: entry.result.verdict,
       findings: entry.result.findings.map(finding => ({
+        ...(finding.id ? { id: finding.id } : {}),
         severity: finding.severity,
         evidence: finding.evidence,
         explanation: finding.explanation,

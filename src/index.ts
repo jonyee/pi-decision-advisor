@@ -10,6 +10,7 @@ import { configureDecision } from "./settings-ui.ts";
 import { showDecisionStatus } from "./status-ui.ts";
 import { ReviewHistory } from "./review-history.ts";
 import { createSecretRedactor, type SecretRedactor } from "./secrets.ts";
+import { findingSummary, formatReview, numberReviewFindings } from "./review-feedback.ts";
 
 interface ReviewedTurn {
   evidence: TurnEvidence;
@@ -22,21 +23,17 @@ interface ReviewedTurn {
   error?: { category: ReviewerErrorCode; detail: string };
 }
 
-function feedbackComponent(text: string, theme: Theme): Container {
-  const [heading, ...lines] = text.split("\n");
-  const component = new Container();
-  component.addChild(new Text(theme.fg("customMessageLabel", theme.bold(heading)), 1, 0));
-  if (lines.length) component.addChild(new Text(theme.fg("customMessageText", lines.join("\n")), 1, 0));
-  return component;
+function reviewColor(result: ReviewResult): "success" | "warning" | "error" {
+  if (result.findings.some(finding => finding.severity === "blocker")) return "error";
+  return result.verdict === "accept" ? "success" : "warning";
 }
 
-function formatReview(result: ReviewResult, turn: number): string {
-  if (!result.findings.length) return result.verdict === "accept"
-    ? `Advisor review (${turn}): The advisor was requested but had no findings.`
-    : `Advisor review (${turn}): The advisor was requested but could not determine whether a correction is needed.`;
-  return [`Advisor review (${turn})`, ...result.findings.map(finding =>
-    `[${finding.severity.toUpperCase()}] ${finding.explanation}\nEvidence: ${finding.evidence}\nRecommendation: ${finding.recommendation}`),
-  ].join("\n\n");
+function feedbackComponent(text: string, theme: Theme, color: "success" | "warning" | "error"): Container {
+  const [heading, ...lines] = text.split("\n");
+  const component = new Container();
+  component.addChild(new Text(theme.fg(color, theme.bold(heading)), 1, 0));
+  if (lines.length) component.addChild(new Text(theme.fg("customMessageText", lines.join("\n")), 1, 0));
+  return component;
 }
 
 export default function decisionAdvisor(pi: ExtensionAPI, options: { reviewWaitMs?: number } = {}) {
@@ -53,11 +50,32 @@ export default function decisionAdvisor(pi: ExtensionAPI, options: { reviewWaitM
   const reviewHistory = new ReviewHistory();
   let turn = 0;
   let primaryCancellation: (() => void) | undefined;
+  let reviewStatusUI: ExtensionContext["ui"] | undefined;
+  let reviewWorkingUI: ExtensionContext["ui"] | undefined;
+  let reviewWorkingHidden = false;
 
+  const restoreReviewWorking = () => {
+    const ui = reviewWorkingUI;
+    reviewWorkingUI = undefined;
+    if (!ui) return;
+    if (!reviewWorkingHidden) ui.setWorkingVisible(false);
+    reviewWorkingHidden = false;
+    // Visibility is persistent: restore it for the next primary run. At settled,
+    // Pi is no longer streaming, so this does not recreate the loader.
+    ui.setWorkingVisible(true);
+  };
+  // A dedicated footer status survives agent_end and the bounded settlement wait.
+  // The shared Working row can only cover the active pre-settlement wait.
+  const updateReviewStatus = (ctx?: ExtensionContext) => {
+    if (ctx?.mode === "tui") reviewStatusUI = ctx.ui;
+    reviewStatusUI?.setStatus("decision-review-activity", reviews.size === 0 ? undefined
+      : reviews.size === 1 ? "Reviewing…" : `Reviewing… (${reviews.size} pending)`);
+  };
   const cancelReviews = () => {
     reviewerController.abort();
     reviewerController = new AbortController();
     reviews.clear();
+    updateReviewStatus();
   };
   const watchPrimaryCancellation = (signal: AbortSignal | undefined) => {
     primaryCancellation?.();
@@ -71,6 +89,11 @@ export default function decisionAdvisor(pi: ExtensionAPI, options: { reviewWaitM
     primaryCancellation?.();
     primaryCancellation = undefined;
     cancelReviews();
+    if (reviewWorkingUI && !reviewWorkingHidden) {
+      reviewWorkingUI.setWorkingVisible(false);
+      reviewWorkingHidden = true;
+    }
+    reviewStatusUI = undefined;
     controller.abort();
     controller = new AbortController();
     last = undefined;
@@ -102,16 +125,17 @@ export default function decisionAdvisor(pi: ExtensionAPI, options: { reviewWaitM
   // Register hidden renderers so resumed score/error entries also stay invisible.
   pi.registerEntryRenderer("decision-report", () => undefined);
   pi.registerEntryRenderer("decision-error", () => undefined);
-  pi.registerEntryRenderer<{ text: string }>("decision-review-error", (entry, _options, theme) => entry.data ? feedbackComponent(entry.data.text, theme) : undefined);
+  pi.registerEntryRenderer<{ text: string }>("decision-review-error", (entry, _options, theme) => entry.data ? feedbackComponent(entry.data.text, theme, "error") : undefined);
   pi.registerEntryRenderer<{ turn: number; result: ReviewResult }>("decision-review", (entry, { expanded }, theme) => {
     if (!entry.data) return undefined;
     const { result, turn: reviewedTurn } = entry.data;
     const component = new Container();
-    if (!result.findings.length) return feedbackComponent(formatReview(result, reviewedTurn), theme);
-    component.addChild(new Text(theme.fg("customMessageLabel", theme.bold(`Advisor review (${reviewedTurn})`)), 1, 0));
+    const color = reviewColor(result);
+    if (!result.findings.length) return feedbackComponent(formatReview(result, reviewedTurn), theme, color);
+    component.addChild(new Text(theme.fg(color, theme.bold(`Advisor review (${reviewedTurn})`)), 1, 0));
     for (const finding of expanded ? result.findings : result.findings.slice(0, 3)) {
-      const severity = theme.fg(finding.severity === "blocker" ? "error" : "warning", `[${finding.severity.toUpperCase()}]`);
-      component.addChild(new Text(`${severity} ${finding.explanation}\n${theme.fg("dim", `Evidence: ${finding.evidence}`)}\nRecommendation: ${finding.recommendation}`, 1, 1));
+      const summary = theme.fg(finding.severity === "blocker" ? "error" : "warning", findingSummary(finding));
+      component.addChild(new Text(`${summary}\n${theme.fg("dim", `Evidence: ${finding.evidence}`)}\nRecommendation: ${finding.recommendation}`, 1, 1));
     }
     if (!expanded && result.findings.length > 3) component.addChild(new Text(theme.fg("dim", `${result.findings.length - 3} more findings — expand transcript details to view.`), 1, 0));
     return component;
@@ -134,8 +158,8 @@ export default function decisionAdvisor(pi: ExtensionAPI, options: { reviewWaitM
           history: reviewHistory.snapshot(captured.turn, captured.settings.reviewHistoryTurns),
         }, reviewRedactor);
         if (signal.aborted) return;
-        captured.result = result;
-        reviewHistory.record({ turn: captured.turn, userRequest: captured.evidence.userRequest, result }, captured.settings.reviewHistoryTurns);
+        captured.result = numberReviewFindings(result, captured.turn);
+        reviewHistory.record({ turn: captured.turn, userRequest: captured.evidence.userRequest, result: captured.result }, captured.settings.reviewHistoryTurns);
         displayReview(captured, ctx, automatic);
       } catch (error) {
         if (signal.aborted) { captured.review = undefined; return; }
@@ -147,7 +171,11 @@ export default function decisionAdvisor(pi: ExtensionAPI, options: { reviewWaitM
     })();
     captured.review = job;
     reviews.add(job);
-    void job.finally(() => reviews.delete(job)).catch(() => {});
+    updateReviewStatus(ctx);
+    void job.finally(() => {
+      // Cancelled/reset generations must not clear a newer review's status.
+      if (reviews.delete(job)) updateReviewStatus();
+    }).catch(() => {});
     return job;
   };
 
@@ -171,7 +199,14 @@ export default function decisionAdvisor(pi: ExtensionAPI, options: { reviewWaitM
   pi.on("session_tree", reset);
   pi.on("session_compact", reset);
   pi.on("session_shutdown", reset);
-  pi.on("agent_start", (_event, ctx) => watchPrimaryCancellation(ctx.signal));
+  pi.on("agent_start", (_event, ctx) => {
+    // A queued continuation owns the loader again; do not hide its Working row.
+    reviewWorkingUI?.setWorkingVisible(true);
+    reviewWorkingUI = undefined;
+    reviewWorkingHidden = false;
+    watchPrimaryCancellation(ctx.signal);
+  });
+  pi.on("agent_settled", restoreReviewWorking);
   pi.on("agent_end", (event, ctx) => {
     const final = event.messages.findLast(message => message.role === "assistant");
     if (ctx.signal?.aborted || (final?.role === "assistant" && final.stopReason === "aborted")) cancelReviews();
@@ -197,8 +232,15 @@ export default function decisionAdvisor(pi: ExtensionAPI, options: { reviewWaitM
     messages.splice(userIndex < 0 ? messages.length : userIndex, 0, ...advice);
     return { messages };
   });
-  pi.on("agent_before_settle", async event => {
+  pi.on("agent_before_settle", async (event, ctx) => {
     if (event.outcome === "aborted") { cancelReviews(); return; }
+    if (ctx.mode === "tui" && reviews.size > 0 && reviewWaitMs > 0) {
+      // agent_end removed the native loader, but Pi is still streaming until
+      // agent_settled. Re-show it without changing its message or animation.
+      reviewWorkingUI = ctx.ui;
+      reviewWorkingHidden = false;
+      ctx.ui.setWorkingVisible(true);
+    }
     await waitForReviews(reviews, controller.signal, reviewWaitMs);
   });
   pi.on("turn_end", async (event, ctx) => {

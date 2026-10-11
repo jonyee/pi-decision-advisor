@@ -3,12 +3,12 @@ import { test } from "node:test";
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createAgentSession, DefaultResourceLoader, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
+import { createAgentSession, DefaultResourceLoader, SessionManager, SettingsManager, type ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import { AzureDecisionClient, MAX_EVIDENCE_TOKENS } from "../src/decision.ts";
 import { createAssistantMessageEventStream, getCurrentTools, type AssistantMessage, type Model, type TranscriptContext } from "@earendil-works/pi-ai";
 import decisionAdvisor from "../src/index.ts";
 import { countEvidenceTokens } from "../src/evidence-tokens.ts";
-import { criterionIds, type DecisionReport, type TurnEvidence } from "../src/types.ts";
+import { criterionIds, type DecisionReport, type ReviewResult, type TurnEvidence } from "../src/types.ts";
 
 // Exercise actual Pi session boundaries, tool execution and projected context. Only
 // the remote model/scoring endpoints are replaced; the extension runtime is real.
@@ -66,7 +66,7 @@ for (const mode of ["json", "print"] as const) test(`${mode}: silent triage sett
     await session.bindExtensions({ mode, onError: error => errors.push(error.error) });
     await session.prompt("Read the reference and compute 17 + 25.");
     assert.doesNotMatch(output.join("\n"), /Decision feedback|Isolated scoring failure|not evaluated|P\(pass\)/);
-    if (mode === "print") assert.match(output.join("\n"), /Advisor review \(\d+\)\n\n\[CONCERN\] Unique verified regression finding/);
+    if (mode === "print") assert.match(output.join("\n"), /Advisor review \(\d+\)\n\nC-\d+01 \[CONCERN\] Unique verified regression finding/);
     else assert.deepEqual(output, []);
     assert.deepEqual(errors, []);
     assert.equal(primaryCalls, 2);
@@ -77,9 +77,22 @@ for (const mode of ["json", "print"] as const) test(`${mode}: silent triage sett
     assert.equal(events.filter(type => type === "decision-review").length, 2);
     assert.ok(events.indexOf("decision-error") < events.indexOf("decision-review"));
     assert.equal(events.filter(type => type === "decision-report").length, 1, "silent scores remain durable diagnostics");
+    const stored = session.sessionManager.getBranch().flatMap(entry => {
+      if (entry.type !== "custom" || entry.customType !== "decision-review") return [];
+      return [entry.data as { turn: number; assistantEntryId: string; result: ReviewResult; content: string }];
+    });
+    const findingIds = stored.map(data => {
+      const id = data.result.findings[0].id;
+      assert.equal(id, `C-${data.turn}01`);
+      assert.ok(data.content.includes(`${id} [CONCERN] Unique verified regression finding`));
+      return id!;
+    });
+    assert.equal(new Set(findingIds).size, 2, "distinct turns get distinct references within the current run");
     await session.prompt("What is the corrected result?");
     assert.equal(primaryCalls, 3);
     assert.match(primaryContexts.at(-1)!, /Unique verified regression finding/);
+    for (const id of findingIds) assert.ok(primaryContexts.at(-1)!.includes(id), "primary context retains addressable references");
+    assert.ok(reviewerContexts.at(-1)!.includes(findingIds[0]), "prior reviewer summaries retain references");
     assert.doesNotMatch(primaryContexts.at(-1)!, /P\(pass\)/);
     const sourceIds = session.sessionManager.getBranch().flatMap(entry => {
       if (entry.type !== "custom" || entry.customType !== "decision-review") return [];
@@ -94,8 +107,10 @@ for (const mode of ["json", "print"] as const) test(`${mode}: silent triage sett
     const reviews = session.sessionManager.getBranch().filter(entry => entry.type === "custom" && entry.customType === "decision-review");
     assert.equal(reviews.length, 4);
     const beforeManual = reviewerCalls;
+    const beforeManualReviews = JSON.stringify(reviews);
     await session.prompt("/decision review");
     assert.equal(reviewerCalls, beforeManual, "manual reuse must not issue a duplicate review");
+    assert.equal(JSON.stringify(session.sessionManager.getBranch().filter(entry => entry.type === "custom" && entry.customType === "decision-review")), beforeManualReviews, "manual reuse retains the original IDs without duplicate entries");
     await session.prompt("/decision off");
     await session.prompt("Automatic scoring is disabled.");
     assert.equal(primaryCalls, 5);
@@ -110,7 +125,7 @@ for (const mode of ["json", "print"] as const) test(`${mode}: silent triage sett
   }
 });
 
-test("bounded hook wait preserves late findings while session reset and user cancellation stop reviewers", async () => {
+for (const mode of ["json", "tui"] as const) test(`${mode}: bounded hook wait preserves late findings while session reset and user cancellation stop reviewers`, async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-advisor-lifecycle-"));
   const agentDir = join(root, "agent");
   const previousDir = process.env.PI_CODING_AGENT_DIR;
@@ -123,6 +138,19 @@ test("bounded hook wait preserves late findings while session reset and user can
   let heldPrimary: ReturnType<typeof createAssistantMessageEventStream> | undefined;
   const appended: string[] = [];
   const persisted = Promise.withResolvers<void>();
+  const statuses: Array<{ key: string; text: string | undefined }> = [];
+  const uiContext = {
+    setStatus: (key: string, text: string | undefined) => { statuses.push({ key, text }); },
+    notify: () => {},
+    setWorkingMessage: () => assert.fail("review activity must not overwrite the primary loader"),
+    setWorkingVisible: () => assert.fail("review activity must not force the primary loader"),
+  } as unknown as ExtensionUIContext;
+  const assertStatus = (expected: string | undefined) => {
+    if (mode === "tui") {
+      assert.equal(statuses.at(-1)?.key, "decision-review-activity");
+      assert.equal(statuses.at(-1)?.text, expected);
+    } else assert.deepEqual(statuses, [], "headless mode has no UI activity calls");
+  };
   const models = ["primary", "reviewer"].map(id => ({ id, name: id, provider: "pi-lifecycle", api: "pi-lifecycle-api", baseUrl: "https://example.invalid", reasoning: false, input: ["text"] as ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 32768, maxTokens: 2000 }));
   AzureDecisionClient.prototype.evaluate = async () => { throw new Error("Isolated scoring failure"); };
   function output(model: Model<string>, text: string): AssistantMessage {
@@ -152,7 +180,7 @@ test("bounded hook wait preserves late findings while session reset and user can
     await resourceLoader.reload();
     ({ session } = await createAgentSession({ cwd: root, agentDir, model: models[0], tools: [], resourceLoader, settingsManager, sessionManager: SessionManager.inMemory(root) }));
     const errors: string[] = [];
-    await session.bindExtensions({ mode: "json", onError: error => errors.push(error.error) });
+    await session.bindExtensions({ mode, uiContext, onError: error => errors.push(error.error) });
     session.subscribe(event => {
       if (event.type !== "entry_appended" || event.entry.type !== "custom") return;
       appended.push(event.entry.customType);
@@ -162,19 +190,26 @@ test("bounded hook wait preserves late findings while session reset and user can
     assert.equal(reviews.length, 1);
     assert.equal(reviews[0]!.signal?.aborted, false, "hook wait must not cancel execution");
     assert.equal(appended.includes("decision-review"), false);
+    assertStatus("Reviewing…"); // Survives agent_end and a zero settlement wait.
     const finding = { severity: "concern", evidence: "17 + 25 = 42", explanation: "Persisted late arithmetic finding", recommendation: "Return 42." };
     finish(reviews[0]!.source, output(reviews[0]!.model, JSON.stringify({ verdict: "revise", findings: [finding] })));
     await persisted.promise;
+    const completed = Promise.withResolvers<void>();
+    setImmediate(completed.resolve);
+    await completed.promise;
+    assertStatus(undefined);
     await session.prompt("Use the verified result.");
     assert.equal(primaryContexts.length, 2, "late findings must not create a hidden primary request");
     assert.match(primaryContexts[1]!, /Persisted late arithmetic finding/);
     assert.equal(reviews.length, 2);
     assert.equal(reviews[1]!.signal?.aborted, false);
+    assertStatus("Reviewing…");
     const firstUser = session.sessionManager.getBranch().find(entry => entry.type === "message" && entry.message.role === "user");
     assert.ok(firstUser);
     const reviewCount = appended.filter(type => type === "decision-review").length;
     assert.equal((await session.navigateTree(firstUser.id, { summarize: false })).cancelled, false);
     assert.equal(reviews[1]!.signal?.aborted, true, "session tree reset must cancel execution");
+    assertStatus(undefined);
     finish(reviews[1]!.source, output(reviews[1]!.model, JSON.stringify({ verdict: "revise", findings: [finding] })));
     const tick = Promise.withResolvers<void>();
     setImmediate(tick.resolve);
@@ -186,8 +221,10 @@ test("bounded hook wait preserves late findings while session reset and user can
     const primaryRun = session.prompt("Cancel this active primary run.");
     await primaryGate.promise;
     assert.equal(reviews[2]!.signal?.aborted, false);
+    assertStatus("Reviewing…");
     const aborted = session.abort();
     assert.equal(reviews[2]!.signal?.aborted, true, "real user cancellation during an active primary run cancels pending reviewers");
+    assertStatus(undefined);
     heldPrimary!.push({ type: "error", reason: "aborted", error: { ...output(models[0]!, ""), stopReason: "aborted", errorMessage: "Fixture cancellation" } });
     await Promise.all([primaryRun, aborted]);
     finish(reviews[2]!.source, output(reviews[2]!.model, JSON.stringify({ verdict: "revise", findings: [finding] })));
@@ -195,13 +232,43 @@ test("bounded hook wait preserves late findings while session reset and user can
     await session.prompt("Review before disabling automatic review.");
     assert.equal(reviews.length, 4);
     assert.equal(reviews[3]!.signal?.aborted, false);
+    assertStatus("Reviewing…");
     await session.prompt("/decision off");
     assert.equal(reviews[3]!.signal?.aborted, true, "enabled-off must cancel in-flight execution");
+    assertStatus(undefined);
+    await session.prompt("/decision on");
+    await session.prompt("Review after the settings reset.");
+    assert.equal(reviews.length, 5);
+    assertStatus("Reviewing…");
+    // The cancelled previous generation resolves while a new review is active.
     finish(reviews[3]!.source, output(reviews[3]!.model, JSON.stringify({ verdict: "revise", findings: [finding] })));
     const afterOff = Promise.withResolvers<void>();
     setImmediate(afterOff.resolve);
     await afterOff.promise;
     assert.equal(appended.filter(type => type === "decision-review").length, reviewCount);
+    assertStatus("Reviewing…");
+    await session.prompt("Run another review concurrently.");
+    assert.equal(reviews.length, 6);
+    assertStatus("Reviewing… (2 pending)");
+    finish(reviews[4]!.source, output(reviews[4]!.model, JSON.stringify({ verdict: "revise", findings: [finding] })));
+    const oneFinished = Promise.withResolvers<void>();
+    setImmediate(oneFinished.resolve);
+    await oneFinished.promise;
+    assertStatus("Reviewing…");
+    await session.prompt("/decision review");
+    assert.equal(reviews.length, 6, "pending manual reuse does not add another job");
+    assertStatus("Reviewing…");
+    finish(reviews[5]!.source, output(reviews[5]!.model, '{"verdict":"accept","findings":[]}'));
+    const allFinished = Promise.withResolvers<void>();
+    setImmediate(allFinished.resolve);
+    await allFinished.promise;
+    assertStatus(undefined);
+    await session.prompt("Start a review before reload.");
+    assert.equal(reviews.length, 7);
+    assertStatus("Reviewing…");
+    await session.extensionRunner.emit({ type: "session_shutdown", reason: "reload" });
+    assert.equal(reviews[6]!.signal?.aborted, true);
+    assertStatus(undefined);
     assert.deepEqual(errors, []);
   } finally {
     session?.dispose();
@@ -288,7 +355,7 @@ test("Pi captures bounded redacted evidence and retains current-only overflow fo
 });
 
 
-test("Pi records distinct review failures and explicit manual retries reuse captured evidence", async () => {
+for (const mode of ["json", "tui"] as const) test(`${mode}: Pi records distinct review failures and explicit manual retries reuse captured evidence`, async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-advisor-categories-"));
   const agentDir = join(root, "agent");
   const previousDir = process.env.PI_CODING_AGENT_DIR;
@@ -298,6 +365,16 @@ test("Pi records distinct review failures and explicit manual retries reuse capt
   let reviewerCalls = 0;
   const pendingSources: ReturnType<typeof createAssistantMessageEventStream>[] = [];
   const categories: string[] = [];
+  const statuses: Array<string | undefined> = [];
+  const uiContext = {
+    setStatus: (_key: string, text: string | undefined) => { statuses.push(text); },
+    setWorkingVisible: () => {},
+    notify: () => {},
+  } as unknown as ExtensionUIContext;
+  const assertActivityCleared = () => {
+    if (mode === "tui") assert.equal(statuses.at(-1), undefined);
+    else assert.deepEqual(statuses, []);
+  };
   const models = ["primary", "reviewer"].map(id => ({ id, name: id, provider: "pi-categories", api: "pi-categories-api", baseUrl: "https://example.invalid", reasoning: false, input: ["text"] as ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 32768, maxTokens: 2000 }));
   try {
     await mkdir(agentDir);
@@ -322,7 +399,7 @@ test("Pi records distinct review failures and explicit manual retries reuse capt
     await resourceLoader.reload();
     ({ session } = await createAgentSession({ cwd: root, agentDir, model: models[0], tools: [], resourceLoader, settingsManager, sessionManager: SessionManager.inMemory(root) }));
     const errors: string[] = [];
-    await session.bindExtensions({ mode: "json", onError: error => errors.push(error.error) });
+    await session.bindExtensions({ mode, uiContext, onError: error => errors.push(error.error) });
     session.subscribe(event => {
       if (event.type !== "entry_appended" || event.entry.type !== "custom" || event.entry.customType !== "decision-review-error") return;
       const data: unknown = event.entry.data;
@@ -335,18 +412,23 @@ test("Pi records distinct review failures and explicit manual retries reuse capt
     });
     await session.prompt("Compute 17 + 25.");
     assert.deepEqual(categories, ["timeout"]);
+    assertActivityCleared();
     failure = "provider";
     await session.prompt("/decision review");
     assert.deepEqual(categories, ["timeout", "provider"]);
+    assertActivityCleared();
     failure = "response";
     await session.prompt("/decision review");
     assert.deepEqual(categories, ["timeout", "provider", "response"]);
+    assertActivityCleared();
     failure = "accept";
     await session.prompt("/decision review");
     assert.equal(reviewerCalls, 4);
     assert.equal(session.sessionManager.getBranch().filter(entry => entry.type === "custom" && entry.customType === "decision-review").length, 1);
     await session.prompt("/decision review");
     assert.equal(reviewerCalls, 4, "completed manual reuse must not call the provider again");
+    assertActivityCleared();
+    if (mode === "tui") assert.deepEqual(statuses, Array.from({ length: 4 }, () => ["Reviewing…", undefined]).flat(), "every execution clears its activity; completed reuse adds no status");
     assert.deepEqual(errors, []);
   } finally {
     session?.dispose();
