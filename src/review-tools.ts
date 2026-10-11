@@ -192,7 +192,7 @@ export function createReviewTools(ctx: ExtensionContext, names: readonly string[
           if (ELEVATED_REVIEW_TOOLS.includes(name)) {
             if (!ctx.hasUI || (ctx.mode !== "tui" && ctx.mode !== "rpc")) throw new Error(`Reviewer ${name} requires interactive per-operation confirmation; denied in headless mode.`);
             const approved = await awaitReviewOperation(() => ctx.ui.confirm(
-              `Decision reviewer: approve ${name}?`,
+              `Advisor review: approve ${name}?`,
               redactor.redactText(`This is not sandboxed. Approve only this operation in ${ctx.cwd}:\n${JSON.stringify(args)}`),
               { signal: operationSignal },
             ), operationSignal);

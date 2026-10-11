@@ -4,7 +4,7 @@ import { AzureDecisionClient, CurrentEvidenceOverflowError, DecisionError, packE
 import { REVIEW_HOST_WAIT_MS, toDecisionOptions, type DecisionSettings } from "./config.ts";
 import { buildEvidence } from "./evidence.ts";
 import { reviewTurn, ReviewerError, ReviewerConfigurationError, waitForReviews, type ReviewerErrorCode } from "./review.ts";
-import { criterionIds, type DecisionReport, type ReviewResult, type TurnEvidence } from "./types.ts";
+import { type DecisionReport, type ReviewResult, type TurnEvidence } from "./types.ts";
 import { loadDecisionSettings, saveDecisionSettings } from "./settings.ts";
 import { configureDecision } from "./settings-ui.ts";
 import { showDecisionStatus } from "./status-ui.ts";
@@ -22,30 +22,19 @@ interface ReviewedTurn {
   error?: { category: ReviewerErrorCode; detail: string };
 }
 
-function formatReport(report: DecisionReport, verbose = false): string {
-  const rows = criterionIds.map(id => {
-    const result = report.criteria[id];
-    return `${id}: ${result.choice}; P(pass) ${(result.probabilities.pass * 100).toFixed(1)}%`;
-  });
-  return [`Decision feedback — turn ${report.turn}`, ...rows,
-    report.flagged.length ? "Failed triage check. The escalation reviewer checks this turn automatically." : "All criteria passed the configured threshold.",
-    ...(verbose ? [JSON.stringify(report, null, 2)] : []),
-    "Scores classify supplied evidence; they are not explanations or proof of correctness."].join("\n");
-}
-
 function feedbackComponent(text: string, theme: Theme): Container {
   const [heading, ...lines] = text.split("\n");
   const component = new Container();
   component.addChild(new Text(theme.fg("customMessageLabel", theme.bold(heading)), 1, 0));
-  component.addChild(new Text(theme.fg("customMessageText", lines.join("\n")), 1, 0));
+  if (lines.length) component.addChild(new Text(theme.fg("customMessageText", lines.join("\n")), 1, 0));
   return component;
 }
 
 function formatReview(result: ReviewResult, turn: number): string {
   if (!result.findings.length) return result.verdict === "accept"
-    ? `Decision reviewer — turn ${turn}\nThe advisor was requested but had no findings.`
-    : `Decision reviewer — turn ${turn}\nThe advisor was requested but could not determine whether a correction is needed.`;
-  return [`Decision reviewer — turn ${turn}`, ...result.findings.map(finding =>
+    ? `Advisor review (${turn}): The advisor was requested but had no findings.`
+    : `Advisor review (${turn}): The advisor was requested but could not determine whether a correction is needed.`;
+  return [`Advisor review (${turn})`, ...result.findings.map(finding =>
     `[${finding.severity.toUpperCase()}] ${finding.explanation}\nEvidence: ${finding.evidence}\nRecommendation: ${finding.recommendation}`),
   ].join("\n\n");
 }
@@ -108,20 +97,18 @@ export default function decisionAdvisor(pi: ExtensionAPI, options: { reviewWaitM
     if (ctx.mode === "print") console.log(content);
   };
 
-  // Durable score/error entries never enter provider context and need no preview widget.
-  pi.registerEntryRenderer<DecisionReport & { verbose?: boolean }>("decision-report", (entry, _options, theme) => {
-    const report = entry.data;
-    return report && (report.flagged.length || report.verbose) ? feedbackComponent(formatReport(report, report.verbose), theme) : undefined;
-  });
-  pi.registerEntryRenderer<{ turn: number; reason: string; detail?: string }>("decision-error", (entry, _options, theme) => entry.data
-    ? feedbackComponent(`Decision feedback — turn ${entry.data.turn}\nStatus: not evaluated (${entry.data.reason}). ${entry.data.detail ? `${entry.data.detail} ` : ""}No pass was recorded. The escalation reviewer checks this turn without a decision score.`, theme) : undefined);
+  // Automatic triage is silent, including failures and saved verbose preferences.
+  // Keep durable diagnostics for session/JSON consumers and explicit /decision status.
+  // Register hidden renderers so resumed score/error entries also stay invisible.
+  pi.registerEntryRenderer("decision-report", () => undefined);
+  pi.registerEntryRenderer("decision-error", () => undefined);
   pi.registerEntryRenderer<{ text: string }>("decision-review-error", (entry, _options, theme) => entry.data ? feedbackComponent(entry.data.text, theme) : undefined);
   pi.registerEntryRenderer<{ turn: number; result: ReviewResult }>("decision-review", (entry, { expanded }, theme) => {
     if (!entry.data) return undefined;
     const { result, turn: reviewedTurn } = entry.data;
     const component = new Container();
     if (!result.findings.length) return feedbackComponent(formatReview(result, reviewedTurn), theme);
-    component.addChild(new Text(theme.fg("customMessageLabel", theme.bold(`Decision reviewer — turn ${reviewedTurn}`)), 1, 0));
+    component.addChild(new Text(theme.fg("customMessageLabel", theme.bold(`Advisor review (${reviewedTurn})`)), 1, 0));
     for (const finding of expanded ? result.findings : result.findings.slice(0, 3)) {
       const severity = theme.fg(finding.severity === "blocker" ? "error" : "warning", `[${finding.severity.toUpperCase()}]`);
       component.addChild(new Text(`${severity} ${finding.explanation}\n${theme.fg("dim", `Evidence: ${finding.evidence}`)}\nRecommendation: ${finding.recommendation}`, 1, 1));
@@ -155,7 +142,7 @@ export default function decisionAdvisor(pi: ExtensionAPI, options: { reviewWaitM
         const failure = error instanceof ReviewerError ? error : new ReviewerError("provider");
         const detail = reviewRedactor?.redactText(failure.message) ?? "Reload the extension before requesting a review.";
         captured.error = { category: failure.code, detail };
-        showError(`Escalation review failed — turn ${captured.turn}\nCategory: ${failure.code}. No reviewer findings were applied. ${detail}`, ctx, { turn: captured.turn, automatic, category: failure.code });
+        showError(`Advisor review (${captured.turn}): Failed (${failure.code}). No reviewer findings were applied. ${detail.replace(/\s*\r?\n\s*/g, " ")}`,  ctx, { turn: captured.turn, automatic, category: failure.code });
       }
     })();
     captured.review = job;
@@ -171,16 +158,14 @@ export default function decisionAdvisor(pi: ExtensionAPI, options: { reviewWaitM
     redactor = undefined;
     configurationError = undefined;
     const generation = controller.signal;
-    let enabled = true;
     try {
       const settings = await loadDecisionSettings(ctx.cwd, { projectTrusted: ctx.isProjectTrusted() });
-      enabled = settings.enabled;
       const nextRedactor = await createSecretRedactor(ctx);
       if (generation.aborted) return;
       redactor = nextRedactor;
       applySettings(settings);
     } catch { configurationError = "Decision settings or secret protection could not be loaded. Open /decision settings to configure them."; }
-    if (configurationError && enabled) ctx.ui.notify(configurationError, "warning");
+    // Configuration failures are triage diagnostics; reviewer feedback remains visible.
   };
   pi.on("session_start", (_event, ctx) => initializeSettings(ctx));
   pi.on("session_tree", reset);
@@ -233,7 +218,6 @@ export default function decisionAdvisor(pi: ExtensionAPI, options: { reviewWaitM
     } catch {
       if (signal.aborted) return;
       pi.appendEntry("decision-error", { turn: currentTurn, reason: "redaction", status: "not_evaluated" });
-      if (ctx.mode === "print") console.log(`Decision feedback — turn ${currentTurn}\nStatus: not evaluated (redaction). No evidence was sent.`);
       return;
     }
     last = captured;
@@ -243,18 +227,13 @@ export default function decisionAdvisor(pi: ExtensionAPI, options: { reviewWaitM
       captured.report = await scoringClient.evaluate(captured.evidence, currentTurn, signal);
       if (signal.aborted) return;
       pi.appendEntry("decision-report", { ...captured.report, verbose: settings.verbose });
-      if (!captured.report.flagged.length) {
-        if (ctx.mode === "print" && settings.verbose) console.log(formatReport(captured.report, true));
-        return;
-      }
-      if (ctx.mode === "print") console.log(formatReport(captured.report, settings.verbose));
+      if (!captured.report.flagged.length) return;
     } catch (error) {
       if (signal.aborted) return;
       const reason = error instanceof DecisionError ? error.code : "configuration";
       const detail = error instanceof CurrentEvidenceOverflowError
         ? `Current evidence alone uses ${error.currentTokens} tokens, above the ${error.maxTokens}-token budget; it was not truncated. The reviewer receives the original redacted evidence.` : undefined;
       pi.appendEntry("decision-error", { turn: currentTurn, reason, detail, status: "not_evaluated" });
-      if (ctx.mode === "print") console.log(`Decision feedback — turn ${currentTurn}\nStatus: not evaluated (${reason}). ${detail ? `${detail} ` : ""}No pass was recorded. The escalation reviewer checks this turn without a decision score.`);
     }
     void startReview(captured, ctx, true);
   });

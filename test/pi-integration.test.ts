@@ -8,23 +8,33 @@ import { AzureDecisionClient, MAX_EVIDENCE_TOKENS } from "../src/decision.ts";
 import { createAssistantMessageEventStream, getCurrentTools, type AssistantMessage, type Model, type TranscriptContext } from "@earendil-works/pi-ai";
 import decisionAdvisor from "../src/index.ts";
 import { countEvidenceTokens } from "../src/evidence-tokens.ts";
-import type { TurnEvidence } from "../src/types.ts";
+import { criterionIds, type DecisionReport, type TurnEvidence } from "../src/types.ts";
 
 // Exercise actual Pi session boundaries, tool execution and projected context. Only
 // the remote model/scoring endpoints are replaced; the extension runtime is real.
-test("per-tool-loop triage settles reviews without hidden primary turns and projects only live-source findings", async () => {
+for (const mode of ["json", "print"] as const) test(`${mode}: silent triage settles reviews without hidden primary turns and projects only live-source findings`, async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-advisor-integration-"));
   const agentDir = join(root, "agent");
   const previousDir = process.env.PI_CODING_AGENT_DIR;
   const originalEvaluate = AzureDecisionClient.prototype.evaluate;
   process.env.PI_CODING_AGENT_DIR = agentDir;
   let session: Awaited<ReturnType<typeof createAgentSession>>["session"] | undefined;
+  const originalLog = console.log;
+  const output: string[] = [];
+  console.log = (...args: unknown[]) => { output.push(args.map(String).join(" ")); };
   let primaryCalls = 0, reviewerCalls = 0;
   const primaryContexts: string[] = [];
   const reviewerContexts: string[] = [];
   const events: string[] = [];
   const models = ["primary", "reviewer"].map(id => ({ id, name: id, provider: "pi-integration", api: "pi-integration-api", baseUrl: "https://example.invalid", reasoning: false, input: ["text"] as ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 32768, maxTokens: 2000 }));
-  AzureDecisionClient.prototype.evaluate = async () => { throw new Error("Isolated scoring failure"); };
+  let scoringCalls = 0;
+  AzureDecisionClient.prototype.evaluate = async (_evidence, turn) => {
+    if (++scoringCalls === 1) throw new Error("Isolated scoring failure");
+    return {
+      turn, model: "fixture", evaluatedAt: new Date().toISOString(), flagged: ["correctness"],
+      criteria: Object.fromEntries(criterionIds.map(id => [id, { choice: "concern", confidence: 0.9, probabilities: { pass: 0.1, concern: 0.9, blocker: 0, cannot_tell: 0 } }])) as DecisionReport["criteria"],
+    };
+  };
   function stream(model: Model<string>, context: TranscriptContext) {
     const reviewer = model.id === "reviewer";
     const text = JSON.stringify(context.messages);
@@ -43,7 +53,7 @@ test("per-tool-loop triage settles reviews without hidden primary turns and proj
   try {
     await mkdir(agentDir);
     await writeFile(join(root, "reference.txt"), "17 + 25 = 42\napi_key=fixture-private-token-123456789\n");
-    await writeFile(join(agentDir, "decision-advisor.json"), JSON.stringify({ endpoint: "https://example.invalid", deployment: "fixture", credentialMode: "default", reviewModel: "pi-integration/reviewer", reviewTools: "read", timeoutMs: 1000, advisorTimeoutMs: 2000 }));
+    await writeFile(join(agentDir, "decision-advisor.json"), JSON.stringify({ endpoint: "https://example.invalid", deployment: "fixture", credentialMode: "default", verbose: true, reviewModel: "pi-integration/reviewer", reviewTools: "read", timeoutMs: 1000, advisorTimeoutMs: 2000 }));
     const settingsManager = SettingsManager.inMemory({ cacheWarming: "off", compaction: { enabled: false }, retry: { enabled: false } });
     const resourceLoader = new DefaultResourceLoader({ cwd: root, agentDir, settingsManager, noExtensions: true, noSkills: true, noThemes: true, noPromptTemplates: true, noContextFiles: true, systemPrompt: "Compute accurately.", extensionFactories: [pi => {
       pi.registerProvider("pi-integration", { api: "pi-integration-api", apiKey: "fixture-key", baseUrl: "https://example.invalid", models, streamSimple: stream });
@@ -53,8 +63,11 @@ test("per-tool-loop triage settles reviews without hidden primary turns and proj
     // Scoring failure must still escalate; Azure transport/batching has separate coverage.
     session.subscribe(event => { if (event.type === "entry_appended" && event.entry.type === "custom") events.push(event.entry.customType); });
     const errors: string[] = [];
-    await session.bindExtensions({ mode: "json", onError: error => errors.push(error.error) });
+    await session.bindExtensions({ mode, onError: error => errors.push(error.error) });
     await session.prompt("Read the reference and compute 17 + 25.");
+    assert.doesNotMatch(output.join("\n"), /Decision feedback|Isolated scoring failure|not evaluated|P\(pass\)/);
+    if (mode === "print") assert.match(output.join("\n"), /Advisor review \(\d+\)\n\n\[CONCERN\] Unique verified regression finding/);
+    else assert.deepEqual(output, []);
     assert.deepEqual(errors, []);
     assert.equal(primaryCalls, 2);
     assert.equal(reviewerCalls, 4);
@@ -63,6 +76,7 @@ test("per-tool-loop triage settles reviews without hidden primary turns and proj
     assert.match(reviewerContexts.join("\n"), /\[REDACTED\]/);
     assert.equal(events.filter(type => type === "decision-review").length, 2);
     assert.ok(events.indexOf("decision-error") < events.indexOf("decision-review"));
+    assert.equal(events.filter(type => type === "decision-report").length, 1, "silent scores remain durable diagnostics");
     await session.prompt("What is the corrected result?");
     assert.equal(primaryCalls, 3);
     assert.match(primaryContexts.at(-1)!, /Unique verified regression finding/);
@@ -88,6 +102,7 @@ test("per-tool-loop triage settles reviews without hidden primary turns and proj
     assert.equal(reviewerCalls, beforeManual);
     assert.equal(JSON.parse(await readFile(join(agentDir, "decision-advisor.json"), "utf8")).enabled, false);
   } finally {
+    console.log = originalLog;
     session?.dispose();
     AzureDecisionClient.prototype.evaluate = originalEvaluate;
     if (previousDir === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = previousDir;
@@ -313,6 +328,9 @@ test("Pi records distinct review failures and explicit manual retries reuse capt
       const data: unknown = event.entry.data;
       assert.ok(data && typeof data === "object" && "category" in data && typeof data.category === "string");
       categories.push(data.category);
+      assert.ok("text" in data && typeof data.text === "string");
+      assert.match(data.text, /^Advisor review \(1\): Failed/);
+      assert.doesNotMatch(data.text, /[\r\n]/);
       assert.doesNotMatch(JSON.stringify(data), /private-provider-body|fixture-private-credential|invalid private review/);
     });
     await session.prompt("Compute 17 + 25.");

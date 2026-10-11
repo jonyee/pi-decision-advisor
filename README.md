@@ -1,6 +1,6 @@
 # Pi Decision advisor
 
-Microsoft-Decision-1 on Azure Foundry reviews every completed **primary model turn**, including tool-loop turns. Passing turns are silent. Failed or unassessed turns automatically start a separately configured tool-capable reviewer. Findings are advisory context for the primary's next natural request; feedback never requests another primary turn.
+Microsoft-Decision-1 on Azure Foundry reviews every completed **primary model turn**, including tool-loop turns. Automatic Decision model calls and results are silent, including failed checks and scoring errors. Failed or unassessed turns automatically start a separately configured tool-capable reviewer. Findings are advisory context for the primary's next natural request; feedback never requests another primary turn.
 
 This is a **stock pi.dev extension**, using `@earendil-works/pi-*`. No OMP fork or native advisor subsystem is required. The Azure deployment utilities remain in this repository.
 
@@ -88,7 +88,7 @@ Azure CLI authentication uses the signed-in `az login` identity. DefaultAzureCre
 - `/decision settings` — deployment, reviewer, tool grants, instructions, history and triage preferences.
 - `/decision status` — configuration, latest scores and **one batched synthetic matching/mismatching arithmetic smoke request** when configured. No conversation history or reviewer invocation. Wrong classification fails; auth/network/malformed responses are errors. TUI-cancellable; available while off.
 - `/decision review` — reuse the captured automatic review, or explicitly review a captured passing turn. Reuse does not duplicate model calls or transcript entries.
-- `/decision verbose [on|off]` — toggle/set saved verbose output.
+- `/decision verbose [on|off]` — toggle/set the saved verbose preference (retained for compatibility; automatic triage remains silent).
 
 A turn is captured only when automatic scoring is enabled. Status remains available without a captured turn.
 
@@ -112,13 +112,13 @@ History contains only completed earlier-turn summaries, sorted by primary turn, 
 
 ## Transcript and output
 
-Scores, scoring errors and review results are durable **Pi custom session entries** with extension-owned renderers. Passing score entries render nothing unless verbose. Failed scores appear before reviewer notes and stay visible during delayed review; no temporary widget replaces them. Findings carry severity, evidence and recommendation. Collapsed reviews show three findings; **Ctrl+O** expands the remainder. Empty accepted/uncertain reviews display explicit notices.
+Scores, scoring errors and review results are durable **Pi custom session entries** with extension-owned renderers. All automatic scores and scoring errors render nothing, even with a saved verbose preference or expanded transcript. Automatic scoring configuration warnings are also suppressed. Use `/decision status` for explicit scoring diagnostics; advisor feedback remains visible. Findings carry severity, evidence and recommendation. Collapsed reviews show three findings; **Ctrl+O** expands the remainder. Empty accepted/uncertain reviews display explicit notices.
 
 Scores/errors never enter model context. Persisted reviews are projected as advisory custom context on later natural requests only while their source assistant entry remains in the current projected context. Branching, compaction or context edits do not resurrect omitted source turns. The canonical primary transcript still ends in its answer, preserving stock Pi's print behavior.
 
-In **text print mode**, the primary answer remains on stdout; Pi routes extension score/review/status diagnostics to stderr. In **JSON mode**, standard `entry_appended` events retain full structured Decision reports and review results regardless of verbose presentation. No private Pi stdout APIs or patched native advisor events are used.
+In **text print mode**, the primary answer remains on stdout; Pi routes extension reviewer feedback and explicit status diagnostics to stderr; automatic scoring produces no text output. In **JSON mode**, standard `entry_appended` events retain full structured Decision reports and review results regardless of verbose presentation. No private Pi stdout APIs or patched native advisor events are used.
 
-Evidence includes the current standing prompt, latest user request, current assistant output and tool results. Those current fields remain intact. The latest user message and current assistant/tool-result copies are excluded from historical context; older context is packed newest-first into complete messages within a **28000-token** serialized-evidence allowance, then presented chronologically. Token counting uses the bundled offline Qwen3.5-9B tokenizer, leaving 4768 tokens within Decision-1's published 32768-token context for rubric, choices and service framing. The service's internal formatting is not exposed, so near-ceiling Azure acceptance is not guaranteed. If current evidence alone exceeds the allowance, the extension reports that separately with token counts and sends no scoring request; the original current evidence remains available for independent review. Evidence is never silently truncated. Attachments are explicitly unavailable to the text-only judge. Review is post-turn and cannot prevent a tool action already executed.
+Evidence includes the current standing prompt, latest user request, current assistant output and tool results. Those current fields remain intact. The latest user message and current assistant/tool-result copies are excluded from historical context; older context is packed newest-first into complete messages within a **28000-token** serialized-evidence allowance, then presented chronologically. Token counting uses the bundled offline Qwen3.5-9B tokenizer, leaving 4768 tokens within Decision-1's published 32768-token context for rubric, choices and service framing. The service's internal formatting is not exposed, so near-ceiling Azure acceptance is not guaranteed. If current evidence alone exceeds the allowance, the extension records that separately with token counts in session/JSON diagnostics and sends no scoring request; the original current evidence remains available for independent review. Evidence is never silently truncated. Attachments are explicitly unavailable to the text-only judge. Review is post-turn and cannot prevent a tool action already executed.
 
 Reviewer failures expose sanitized categories: `timeout`, `cancelled`, `configuration`, `provider`, `tool`, or `response`. A timeout reports the reviewer deadline rather than suggesting credentials. Provider errors do not print upstream bodies, tokens or private endpoint details; configuration and response failures never become accepted reviews.
 
@@ -157,6 +157,8 @@ npm run check
 npm test
 npm run probe
 ```
+
+Current automated silence checks cover failed/error scoring in print and JSON sessions with verbose enabled, hidden score/error renderers (including resumed entries), and preserved advisor findings. These are separate from the historical CLI/TUI smokes below, which predate fully silent automatic triage.
 
 Stock Pi 0.99.2 CLI smokes used a local TLS System One fixture with the real Azure Identity CLI path and deterministic chat providers. They exercised batched tool-loop scoring, selected-tool file reads, evidence/tool-result redaction, scores-before-notes, findings in the next natural prompt, silent passing output, accepted-review print output, headless mutation denial and status smoke while off. Two prompts with a primary file-read loop produced three primary calls, with no feedback-triggered calls.
 
