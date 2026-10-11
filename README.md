@@ -114,6 +114,18 @@ History contains only completed earlier-turn summaries, sorted by primary turn, 
 
 Scores, scoring errors and review results are durable **Pi custom session entries** with extension-owned renderers. All automatic scores and scoring errors render nothing, even with a saved verbose preference or expanded transcript. Automatic scoring configuration warnings are also suppressed. Use `/decision status` for explicit scoring diagnostics; advisor feedback remains visible. Findings carry severity, evidence and recommendation. Collapsed reviews show three findings; **Ctrl+O** expands the remainder. Empty accepted/uncertain reviews display explicit notices.
 
+Advisor TUI colors use the active theme's semantic tokens (normally green/yellow/red), not the generic custom-message label color:
+
+| Review outcome | Color | Meaning |
+|---|---|---|
+| `accept` (no findings) | `success` / green | The reviewer found no issue to report; this does not prove Decision scoring passed or correctness |
+| `revise` with concerns only | `warning` / yellow | At least one material issue needs correction |
+| Any review containing a blocker | `error` / red | A serious issue was reported; the heading stays red even if the blocker is collapsed |
+| `cannot_tell` without blockers | `warning` / yellow | The reviewer could not reach a reliable conclusion; it may still report concerns |
+| Review failure | `error` / red | Review execution/configuration/response failed; no reviewer findings were applied |
+
+Individual finding labels and explanations use their severity color; evidence and recommendations remain neutral. These colors affect TUI rendering only, including stored entries after reload. Color styling does not alter print text, structured results or advisory model context. Cancelled extension-owned work is normally suppressed rather than displayed as a review failure.
+
 Scores/errors never enter model context. Persisted reviews are projected as advisory custom context on later natural requests only while their source assistant entry remains in the current projected context. Branching, compaction or context edits do not resurrect omitted source turns. The canonical primary transcript still ends in its answer, preserving stock Pi's print behavior.
 
 In **text print mode**, the primary answer remains on stdout; Pi routes extension reviewer feedback and explicit status diagnostics to stderr; automatic scoring produces no text output. In **JSON mode**, standard `entry_appended` events retain full structured Decision reports and review results regardless of verbose presentation. No private Pi stdout APIs or patched native advisor events are used.

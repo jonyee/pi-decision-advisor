@@ -22,10 +22,15 @@ interface ReviewedTurn {
   error?: { category: ReviewerErrorCode; detail: string };
 }
 
-function feedbackComponent(text: string, theme: Theme): Container {
+function reviewColor(result: ReviewResult): "success" | "warning" | "error" {
+  if (result.findings.some(finding => finding.severity === "blocker")) return "error";
+  return result.verdict === "accept" ? "success" : "warning";
+}
+
+function feedbackComponent(text: string, theme: Theme, color: "success" | "warning" | "error"): Container {
   const [heading, ...lines] = text.split("\n");
   const component = new Container();
-  component.addChild(new Text(theme.fg("customMessageLabel", theme.bold(heading)), 1, 0));
+  component.addChild(new Text(theme.fg(color, theme.bold(heading)), 1, 0));
   if (lines.length) component.addChild(new Text(theme.fg("customMessageText", lines.join("\n")), 1, 0));
   return component;
 }
@@ -102,16 +107,17 @@ export default function decisionAdvisor(pi: ExtensionAPI, options: { reviewWaitM
   // Register hidden renderers so resumed score/error entries also stay invisible.
   pi.registerEntryRenderer("decision-report", () => undefined);
   pi.registerEntryRenderer("decision-error", () => undefined);
-  pi.registerEntryRenderer<{ text: string }>("decision-review-error", (entry, _options, theme) => entry.data ? feedbackComponent(entry.data.text, theme) : undefined);
+  pi.registerEntryRenderer<{ text: string }>("decision-review-error", (entry, _options, theme) => entry.data ? feedbackComponent(entry.data.text, theme, "error") : undefined);
   pi.registerEntryRenderer<{ turn: number; result: ReviewResult }>("decision-review", (entry, { expanded }, theme) => {
     if (!entry.data) return undefined;
     const { result, turn: reviewedTurn } = entry.data;
     const component = new Container();
-    if (!result.findings.length) return feedbackComponent(formatReview(result, reviewedTurn), theme);
-    component.addChild(new Text(theme.fg("customMessageLabel", theme.bold(`Advisor review (${reviewedTurn})`)), 1, 0));
+    const color = reviewColor(result);
+    if (!result.findings.length) return feedbackComponent(formatReview(result, reviewedTurn), theme, color);
+    component.addChild(new Text(theme.fg(color, theme.bold(`Advisor review (${reviewedTurn})`)), 1, 0));
     for (const finding of expanded ? result.findings : result.findings.slice(0, 3)) {
-      const severity = theme.fg(finding.severity === "blocker" ? "error" : "warning", `[${finding.severity.toUpperCase()}]`);
-      component.addChild(new Text(`${severity} ${finding.explanation}\n${theme.fg("dim", `Evidence: ${finding.evidence}`)}\nRecommendation: ${finding.recommendation}`, 1, 1));
+      const summary = theme.fg(finding.severity === "blocker" ? "error" : "warning", `[${finding.severity.toUpperCase()}] ${finding.explanation}`);
+      component.addChild(new Text(`${summary}\n${theme.fg("dim", `Evidence: ${finding.evidence}`)}\nRecommendation: ${finding.recommendation}`, 1, 1));
     }
     if (!expanded && result.findings.length > 3) component.addChild(new Text(theme.fg("dim", `${result.findings.length - 3} more findings — expand transcript details to view.`), 1, 0));
     return component;
