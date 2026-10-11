@@ -9,14 +9,14 @@ This is a **stock pi.dev extension**, using `@earendil-works/pi-*`. No OMP fork 
 Requires **Pi 0.99.2 or newer** and Node **22.19+**. Development dependencies and runtime verification target stock Pi 0.99.2; Pi 1.1.0 exposes the same required APIs.
 
 ```sh
-pi install git:github.com/jonyee/omp-decision-advisor
+pi install git:github.com/jonyee/pi-decision-advisor
 ```
 
-The repository URL retains its original name; the package is now `pi-decision-advisor`. For a checkout:
+The Pi extension lives in `jonyee/pi-decision-advisor`; the OMP implementation has a separate repository, `jonyee/omp-decision-advisor`. For a checkout:
 
 ```sh
 npm ci --ignore-scripts
-pi install /path/to/omp-decision-advisor
+pi install /path/to/pi-decision-advisor
 ```
 
 Restart Pi or reload extensions after installation. Remove with `pi remove <installed-source>`.
@@ -174,6 +174,7 @@ Replaying the supplied 36-turn export through deduplication and historical packi
 - Extension-owned private preferences with trusted read-only project overrides and explicit reviewer model IDs.
 - Isolated selected-tool reviewer, per-operation elevated approval, fail-closed headless execution and one-way secret redaction.
 - Pi launcher/probe configuration and behavioral regression coverage for host integration, cancellation, approvals and persistence.
+- Moved the Pi port and subsequent integration fixes to `jonyee/pi-decision-advisor`, preserving the original repository history.
 - Offline 28000-token evidence allowance with current-turn deduplication, newest-first historical packing and explicit current-only overflow reporting.
 - Independent reviewer execution deadline (60000 ms default, up to 120000 ms), bounded 20000 ms settlement wait and sanitized failure categories.
 
