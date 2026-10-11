@@ -8,7 +8,7 @@ import { AzureDecisionClient, MAX_EVIDENCE_TOKENS } from "../src/decision.ts";
 import { createAssistantMessageEventStream, getCurrentTools, type AssistantMessage, type Model, type TranscriptContext } from "@earendil-works/pi-ai";
 import decisionAdvisor from "../src/index.ts";
 import { countEvidenceTokens } from "../src/evidence-tokens.ts";
-import { criterionIds, type DecisionReport, type TurnEvidence } from "../src/types.ts";
+import { criterionIds, type DecisionReport, type ReviewResult, type TurnEvidence } from "../src/types.ts";
 
 // Exercise actual Pi session boundaries, tool execution and projected context. Only
 // the remote model/scoring endpoints are replaced; the extension runtime is real.
@@ -66,7 +66,7 @@ for (const mode of ["json", "print"] as const) test(`${mode}: silent triage sett
     await session.bindExtensions({ mode, onError: error => errors.push(error.error) });
     await session.prompt("Read the reference and compute 17 + 25.");
     assert.doesNotMatch(output.join("\n"), /Decision feedback|Isolated scoring failure|not evaluated|P\(pass\)/);
-    if (mode === "print") assert.match(output.join("\n"), /Advisor review \(\d+\)\n\n\[CONCERN\] Unique verified regression finding/);
+    if (mode === "print") assert.match(output.join("\n"), /Advisor review \(\d+\)\n\nC-\d+01 \[CONCERN\] Unique verified regression finding/);
     else assert.deepEqual(output, []);
     assert.deepEqual(errors, []);
     assert.equal(primaryCalls, 2);
@@ -77,9 +77,22 @@ for (const mode of ["json", "print"] as const) test(`${mode}: silent triage sett
     assert.equal(events.filter(type => type === "decision-review").length, 2);
     assert.ok(events.indexOf("decision-error") < events.indexOf("decision-review"));
     assert.equal(events.filter(type => type === "decision-report").length, 1, "silent scores remain durable diagnostics");
+    const stored = session.sessionManager.getBranch().flatMap(entry => {
+      if (entry.type !== "custom" || entry.customType !== "decision-review") return [];
+      return [entry.data as { turn: number; assistantEntryId: string; result: ReviewResult; content: string }];
+    });
+    const findingIds = stored.map(data => {
+      const id = data.result.findings[0].id;
+      assert.equal(id, `C-${data.turn}01`);
+      assert.ok(data.content.includes(`${id} [CONCERN] Unique verified regression finding`));
+      return id!;
+    });
+    assert.equal(new Set(findingIds).size, 2, "distinct turns get distinct references within the current run");
     await session.prompt("What is the corrected result?");
     assert.equal(primaryCalls, 3);
     assert.match(primaryContexts.at(-1)!, /Unique verified regression finding/);
+    for (const id of findingIds) assert.ok(primaryContexts.at(-1)!.includes(id), "primary context retains addressable references");
+    assert.ok(reviewerContexts.at(-1)!.includes(findingIds[0]), "prior reviewer summaries retain references");
     assert.doesNotMatch(primaryContexts.at(-1)!, /P\(pass\)/);
     const sourceIds = session.sessionManager.getBranch().flatMap(entry => {
       if (entry.type !== "custom" || entry.customType !== "decision-review") return [];
@@ -94,8 +107,10 @@ for (const mode of ["json", "print"] as const) test(`${mode}: silent triage sett
     const reviews = session.sessionManager.getBranch().filter(entry => entry.type === "custom" && entry.customType === "decision-review");
     assert.equal(reviews.length, 4);
     const beforeManual = reviewerCalls;
+    const beforeManualReviews = JSON.stringify(reviews);
     await session.prompt("/decision review");
     assert.equal(reviewerCalls, beforeManual, "manual reuse must not issue a duplicate review");
+    assert.equal(JSON.stringify(session.sessionManager.getBranch().filter(entry => entry.type === "custom" && entry.customType === "decision-review")), beforeManualReviews, "manual reuse retains the original IDs without duplicate entries");
     await session.prompt("/decision off");
     await session.prompt("Automatic scoring is disabled.");
     assert.equal(primaryCalls, 5);

@@ -3,6 +3,7 @@ import { test } from "node:test";
 import type { ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
 import decisionAdvisor from "../src/index.ts";
 import type { ReviewFinding, ReviewResult } from "../src/types.ts";
+import { numberReviewFindings } from "../src/review-feedback.ts";
 
 function getRenderers() {
   const renderers = new Map<string, (...args: any[]) => unknown>();
@@ -55,14 +56,17 @@ test("review colors reflect verdict and worst severity, including collapsed bloc
         fg: (color: string, text: string) => { calls.push({ color, text }); return text; },
         bold: (text: string) => text,
       } as Theme;
-      const result = { model: "reviewer", verdict, findings };
+      const result = numberReviewFindings({ model: "reviewer", verdict, findings }, 2);
       const component = renderer({ data: { turn: 2, result } }, { expanded }, theme) as { render(width: number): string[] };
-      component.render(200);
+      const lines = component.render(200).join("\n");
+      if (result.findings.length > 3) {
+        assert.equal(lines.includes("B-204"), expanded, "expansion retains original finding numbering");
+      }
       assert.equal(calls[0].color, color, `${verdict} heading (expanded=${expanded})`);
       assert.match(calls[0].text, /^Advisor review \(2\)/);
       for (const item of expanded ? result.findings : result.findings.slice(0, 3)) {
         assert.ok(calls.some(call => call.color === (item.severity === "blocker" ? "error" : "warning")
-          && call.text === `[${item.severity.toUpperCase()}] ${item.explanation}`), "finding label and explanation share severity color");
+          && call.text === `${item.id} [${item.severity.toUpperCase()}] ${item.explanation}`), "finding ID, label and explanation share severity color");
       }
       assert.ok(calls.every(call => call.color !== "customMessageLabel"), "no generic pink headings");
     }

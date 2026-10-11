@@ -126,6 +126,24 @@ Advisor TUI colors use the active theme's semantic tokens (normally green/yellow
 
 Individual finding labels and explanations use their severity color; evidence and recommendations remain neutral. These colors affect TUI rendering only, including stored entries after reload. Color styling does not alter print text, structured results or advisory model context. Cancelled extension-owned work is normally suppressed rather than displayed as a review failure.
 
+### Addressing individual findings
+
+The reviewer supplies structured findings; the extension assigns each validated finding a compact reference of the form **`<severity>-<turn><two-digit-finding-number>`**. `C` means concern and `B` means blocker (the only finding severities), for example:
+
+```text
+Advisor review (2)
+
+C-201 [CONCERN] The implementation ignores an empty input.
+Evidence: src/parser.ts:42
+Recommendation: Handle an empty input explicitly.
+```
+
+Use a natural follow-up such as **"Fix C-201, and explain whether B-202 is still relevant."** Findings are numbered in their returned order across severities: `C-201` is turn 2/finding 01, `B-202` is turn 2/finding 02. Single-digit turns have four ID characters plus the hyphen; multi-digit turns keep their full number (`C-1301` for turn 13/finding 01). Ordinals over 99 use an extra separator (`C-2-100`) to avoid ambiguity rather than wrapping.
+
+The same IDs appear in TUI and print output, persisted review JSON (`findings[].id`), advisory primary-model context and bounded previous-review summaries. IDs stay stable on expansion, saved-result reload and `/decision review` reuse. They are local references, **not globally unique**: settings changes, on/off, branching, compaction and session/reload resets can restart the turn counter and reuse short IDs. They identify finding occurrences, not a globally deduplicated issue; later reviews of the same defect receive references for their own turns. Existing saved IDs (including the former long format) are preserved; unnumbered reviews remain readable and are not rewritten. Empty reviews have no findings to number. References do not implement an automatic fix or resolution-tracking command.
+
+You can influence investigation and wording through **`/decision settings` → Instructions**. The extension owns the JSON contract, validation, IDs and rendered notices (including "had no findings"); the model is not asked to maintain a numbering counter.
+
 Scores/errors never enter model context. Persisted reviews are projected as advisory custom context on later natural requests only while their source assistant entry remains in the current projected context. Branching, compaction or context edits do not resurrect omitted source turns. The canonical primary transcript still ends in its answer, preserving stock Pi's print behavior.
 
 In **text print mode**, the primary answer remains on stdout; Pi routes extension reviewer feedback and explicit status diagnostics to stderr; automatic scoring produces no text output. In **JSON mode**, standard `entry_appended` events retain full structured Decision reports and review results regardless of verbose presentation. No private Pi stdout APIs or patched native advisor events are used.

@@ -10,6 +10,7 @@ import { configureDecision } from "./settings-ui.ts";
 import { showDecisionStatus } from "./status-ui.ts";
 import { ReviewHistory } from "./review-history.ts";
 import { createSecretRedactor, type SecretRedactor } from "./secrets.ts";
+import { findingSummary, formatReview, numberReviewFindings } from "./review-feedback.ts";
 
 interface ReviewedTurn {
   evidence: TurnEvidence;
@@ -33,15 +34,6 @@ function feedbackComponent(text: string, theme: Theme, color: "success" | "warni
   component.addChild(new Text(theme.fg(color, theme.bold(heading)), 1, 0));
   if (lines.length) component.addChild(new Text(theme.fg("customMessageText", lines.join("\n")), 1, 0));
   return component;
-}
-
-function formatReview(result: ReviewResult, turn: number): string {
-  if (!result.findings.length) return result.verdict === "accept"
-    ? `Advisor review (${turn}): The advisor was requested but had no findings.`
-    : `Advisor review (${turn}): The advisor was requested but could not determine whether a correction is needed.`;
-  return [`Advisor review (${turn})`, ...result.findings.map(finding =>
-    `[${finding.severity.toUpperCase()}] ${finding.explanation}\nEvidence: ${finding.evidence}\nRecommendation: ${finding.recommendation}`),
-  ].join("\n\n");
 }
 
 export default function decisionAdvisor(pi: ExtensionAPI, options: { reviewWaitMs?: number } = {}) {
@@ -116,7 +108,7 @@ export default function decisionAdvisor(pi: ExtensionAPI, options: { reviewWaitM
     if (!result.findings.length) return feedbackComponent(formatReview(result, reviewedTurn), theme, color);
     component.addChild(new Text(theme.fg(color, theme.bold(`Advisor review (${reviewedTurn})`)), 1, 0));
     for (const finding of expanded ? result.findings : result.findings.slice(0, 3)) {
-      const summary = theme.fg(finding.severity === "blocker" ? "error" : "warning", `[${finding.severity.toUpperCase()}] ${finding.explanation}`);
+      const summary = theme.fg(finding.severity === "blocker" ? "error" : "warning", findingSummary(finding));
       component.addChild(new Text(`${summary}\n${theme.fg("dim", `Evidence: ${finding.evidence}`)}\nRecommendation: ${finding.recommendation}`, 1, 1));
     }
     if (!expanded && result.findings.length > 3) component.addChild(new Text(theme.fg("dim", `${result.findings.length - 3} more findings — expand transcript details to view.`), 1, 0));
@@ -140,8 +132,8 @@ export default function decisionAdvisor(pi: ExtensionAPI, options: { reviewWaitM
           history: reviewHistory.snapshot(captured.turn, captured.settings.reviewHistoryTurns),
         }, reviewRedactor);
         if (signal.aborted) return;
-        captured.result = result;
-        reviewHistory.record({ turn: captured.turn, userRequest: captured.evidence.userRequest, result }, captured.settings.reviewHistoryTurns);
+        captured.result = numberReviewFindings(result, captured.turn);
+        reviewHistory.record({ turn: captured.turn, userRequest: captured.evidence.userRequest, result: captured.result }, captured.settings.reviewHistoryTurns);
         displayReview(captured, ctx, automatic);
       } catch (error) {
         if (signal.aborted) { captured.review = undefined; return; }

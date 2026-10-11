@@ -30,6 +30,8 @@ export interface DecisionSmokeResult {
   };
 }
 export interface ReviewFinding {
+  /** Assigned by the extension after validation; absent in raw or older reviews. */
+  id?: string;
   severity: "concern" | "blocker";
   evidence: string;
   explanation: string;
