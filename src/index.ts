@@ -51,9 +51,21 @@ export default function decisionAdvisor(pi: ExtensionAPI, options: { reviewWaitM
   let turn = 0;
   let primaryCancellation: (() => void) | undefined;
   let reviewStatusUI: ExtensionContext["ui"] | undefined;
+  let reviewWorkingUI: ExtensionContext["ui"] | undefined;
+  let reviewWorkingHidden = false;
 
+  const restoreReviewWorking = () => {
+    const ui = reviewWorkingUI;
+    reviewWorkingUI = undefined;
+    if (!ui) return;
+    if (!reviewWorkingHidden) ui.setWorkingVisible(false);
+    reviewWorkingHidden = false;
+    // Visibility is persistent: restore it for the next primary run. At settled,
+    // Pi is no longer streaming, so this does not recreate the loader.
+    ui.setWorkingVisible(true);
+  };
   // A dedicated footer status survives agent_end and the bounded settlement wait.
-  // Do not borrow the primary loader: it is streaming-only and shared with other work.
+  // The shared Working row can only cover the active pre-settlement wait.
   const updateReviewStatus = (ctx?: ExtensionContext) => {
     if (ctx?.mode === "tui") reviewStatusUI = ctx.ui;
     reviewStatusUI?.setStatus("decision-review-activity", reviews.size === 0 ? undefined
@@ -77,6 +89,10 @@ export default function decisionAdvisor(pi: ExtensionAPI, options: { reviewWaitM
     primaryCancellation?.();
     primaryCancellation = undefined;
     cancelReviews();
+    if (reviewWorkingUI && !reviewWorkingHidden) {
+      reviewWorkingUI.setWorkingVisible(false);
+      reviewWorkingHidden = true;
+    }
     reviewStatusUI = undefined;
     controller.abort();
     controller = new AbortController();
@@ -183,7 +199,14 @@ export default function decisionAdvisor(pi: ExtensionAPI, options: { reviewWaitM
   pi.on("session_tree", reset);
   pi.on("session_compact", reset);
   pi.on("session_shutdown", reset);
-  pi.on("agent_start", (_event, ctx) => watchPrimaryCancellation(ctx.signal));
+  pi.on("agent_start", (_event, ctx) => {
+    // A queued continuation owns the loader again; do not hide its Working row.
+    reviewWorkingUI?.setWorkingVisible(true);
+    reviewWorkingUI = undefined;
+    reviewWorkingHidden = false;
+    watchPrimaryCancellation(ctx.signal);
+  });
+  pi.on("agent_settled", restoreReviewWorking);
   pi.on("agent_end", (event, ctx) => {
     const final = event.messages.findLast(message => message.role === "assistant");
     if (ctx.signal?.aborted || (final?.role === "assistant" && final.stopReason === "aborted")) cancelReviews();
@@ -209,8 +232,15 @@ export default function decisionAdvisor(pi: ExtensionAPI, options: { reviewWaitM
     messages.splice(userIndex < 0 ? messages.length : userIndex, 0, ...advice);
     return { messages };
   });
-  pi.on("agent_before_settle", async event => {
+  pi.on("agent_before_settle", async (event, ctx) => {
     if (event.outcome === "aborted") { cancelReviews(); return; }
+    if (ctx.mode === "tui" && reviews.size > 0 && reviewWaitMs > 0) {
+      // agent_end removed the native loader, but Pi is still streaming until
+      // agent_settled. Re-show it without changing its message or animation.
+      reviewWorkingUI = ctx.ui;
+      reviewWorkingHidden = false;
+      ctx.ui.setWorkingVisible(true);
+    }
     await waitForReviews(reviews, controller.signal, reviewWaitMs);
   });
   pi.on("turn_end", async (event, ctx) => {
